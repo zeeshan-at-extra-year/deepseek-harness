@@ -19,11 +19,17 @@ import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { RECONNECT_DEFAULTS, resolveReconnectPolicy, startConnection } from './connection.ts'
 import type { ReconnectConfig } from './connection.ts'
+import { buildAuthProvider } from './auth.ts'
+import type { OAuthAuthConfig } from './auth.ts'
 // Side-effect type import: declaration-merges `ctx.tools` onto Context.
 import type {} from '@deepseek-ai/dsh-tools'
+// Side-effect type import: declaration-merges `mcp-client/state` onto Events.
+import type {} from './state.ts'
 
 export type { McpResult } from './tools.ts'
 export type { ReconnectConfig, ResolvedReconnectPolicy } from './connection.ts'
+export type { McpClientState, McpClientPhase } from './state.ts'
+export type { OAuthAuthConfig } from './auth.ts'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-client'
@@ -92,6 +98,13 @@ export interface StreamableHttpConfig {
   failOnStartupError: boolean
   /** Automatic reconnect policy after a lost connection; omission uses the defaults. */
   reconnect?: ReconnectConfig
+  /**
+   * Optional OAuth overrides. OAuth is always enabled for streamable-http
+   * transports (the SDK discovers auth requirements from the server's 401
+   * response). These overrides customize the callback port, storage
+   * directory, or client metadata used for dynamic registration.
+   */
+  auth?: OAuthAuthConfig
 }
 
 /** Configuration for one stdio or Streamable HTTP MCP server. */
@@ -99,8 +112,8 @@ export type Config = StdioConfig | StreamableHttpConfig
 
 type StdioConfigInput = Omit<StdioConfig, 'args' | 'env' | 'cwd' | 'toolCallTimeoutMs' | 'failOnStartupError'>
   & Partial<Pick<StdioConfig, 'args' | 'env' | 'cwd' | 'toolCallTimeoutMs' | 'failOnStartupError'>>
-type StreamableHttpConfigInput = Omit<StreamableHttpConfig, 'headers' | 'toolCallTimeoutMs' | 'failOnStartupError'>
-  & Partial<Pick<StreamableHttpConfig, 'headers' | 'toolCallTimeoutMs' | 'failOnStartupError'>>
+type StreamableHttpConfigInput = Omit<StreamableHttpConfig, 'headers' | 'toolCallTimeoutMs' | 'failOnStartupError' | 'auth'>
+  & Partial<Pick<StreamableHttpConfig, 'headers' | 'toolCallTimeoutMs' | 'failOnStartupError' | 'auth'>>
 type ConfigInput = StdioConfigInput | StreamableHttpConfigInput
 
 const Reconnect: z<ReconnectConfig> = z.object({
@@ -130,6 +143,11 @@ export const Config = z.union([
     toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
     failOnStartupError: z.boolean().default(false),
     reconnect: Reconnect,
+    auth: z.object({
+      clientMetadata: z.any(),
+      callbackPort: z.number(),
+      storageDir: z.string(),
+    }),
   }),
 ]) as unknown as z<ConfigInput, Config>
 
@@ -167,10 +185,24 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return () => void names.delete(config.serverName)
   }, 'mcp-client.serverName')
 
+  // Every streamable-http transport gets an OAuth auth provider so the SDK
+  // can handle 401 responses automatically via RFC 9728 discovery + dynamic
+  // client registration. No user configuration required; optional overrides
+  // (callbackPort, storageDir, clientMetadata) come from config.auth.
+  const authHandle = config.transport === 'streamable-http'
+    ? buildAuthProvider(config.serverName, config.auth)
+    : undefined
+
+  if (authHandle !== undefined) {
+    ctx.effect(() => {
+      return () => authHandle.callbackServer.close()
+    }, 'mcp-client.oauth-callback')
+  }
+
   // The supervisor owns the client/transport generations, the reconnect
   // loop, and the live tool registrations; disposal stops reconnection,
   // quiesces in-flight work, and unregisters the current generation.
-  const connection = startConnection(ctx, config, reconnect)
+  const connection = startConnection(ctx, config, reconnect, authHandle)
 
   ctx.effect(() => {
     return () => connection.dispose()

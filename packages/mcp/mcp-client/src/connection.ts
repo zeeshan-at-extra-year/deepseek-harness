@@ -12,17 +12,28 @@
  * restarting forever. Exhaustion unregisters the server's tools and stops;
  * disposal (including HMR) is the only way back from that state.
  *
+ * The supervisor emits `mcp-client/state` events at each lifecycle transition
+ * and exposes PID for stdio transports when accessible.
+ *
  * @module
  */
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
+import type { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import type { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js'
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { Context } from '@deepseek-ai/cordis'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { createTransport } from './transport.ts'
 import { syncTools } from './tools.ts'
 import type { ToolBridgeOptions, ToolDisposers } from './tools.ts'
 import type { Config } from './index.ts'
+import type { AuthProviderHandle } from './auth.ts'
+import { McpClientStateTracker } from './state.ts'
+import type { McpClientState } from './state.ts'
+// Side-effect type import: declaration-merges `mcp-client/state` onto Events.
+import type {} from './state.ts'
 
 /** Automatic reconnect policy for one MCP server connection. */
 export interface ReconnectConfig {
@@ -109,6 +120,8 @@ export interface ConnectionHandle {
    * still owns.
    */
   dispose(): Promise<void>
+  /** Current connection state snapshot. */
+  state(): Readonly<McpClientState>
 }
 
 /**
@@ -118,9 +131,12 @@ export interface ConnectionHandle {
  * @param ctx - Cordis context providing the `tools` registry and logger.
  * @param config - Resolved plugin config selecting the transport and server identity.
  * @param policy - Resolved reconnect policy from {@link resolveReconnectPolicy}.
+ * @param authHandle - OAuth provider handle for Streamable HTTP transports; undefined for stdio.
  * @returns Handle with a `ready` promise for startup-await and a `dispose` for teardown.
  */
-export function startConnection(ctx: Context, config: Config, policy: ResolvedReconnectPolicy): ConnectionHandle {
+export function startConnection(
+  ctx: Context, config: Config, policy: ResolvedReconnectPolicy, authHandle?: AuthProviderHandle,
+): ConnectionHandle {
   const label = `mcp-client(${config.serverName})`
   const opts: ToolBridgeOptions = {
     registrationFailure: 'contain',
@@ -134,11 +150,15 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     ? { ...opts, registrationFailure: 'throw' }
     : opts
 
+  const stateTracker = new McpClientStateTracker(ctx, config.serverName, config.transport, policy.maxAttempts)
+
   let disposed = false
   /** Current generation: the connecting or connected client; undefined during backoff waits and after final failure. */
   let client: Client | undefined
   /** Close signal paired with {@link client}; captured by dispose before current ownership is cleared. */
   let clientClosed: Promise<void> | undefined
+  /** Current stdio transport, for PID access after connect. */
+  let currentStdioTransport: StdioClientTransport | undefined
   /** Live tool registrations owned by this server; only {@link enqueueSync} and dispose swap it. */
   let disposers: ToolDisposers = new Map()
   let reconnectTimer: NodeJS.Timeout | undefined
@@ -200,9 +220,13 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     }
     // A connection that stayed up past the stability window (= maxDelayMs, the
     // longest backoff spacing) ended the previous outage: start a fresh budget.
-    if (connectedAt !== undefined && Date.now() - connectedAt >= policy.maxDelayMs) failedAttempts = 0
+    if (connectedAt !== undefined && Date.now() - connectedAt >= policy.maxDelayMs) {
+      failedAttempts = 0
+      stateTracker.resetBudget()
+    }
     connectedAt = undefined
     failedAttempts += 1
+    stateTracker.setFailedAttempts(failedAttempts)
     if (failedAttempts > policy.maxAttempts) {
       // Enqueue the give-up disposal so it cannot race an in-flight sync's
       // phase-2 swap (which checks isCurrent inside the queue).
@@ -210,12 +234,14 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
         for (const dispose of disposers.values()) dispose()
         disposers = new Map()
       })
+      stateTracker.exhausted()
       ctx.logger.error(`${label}: giving up after ${policy.maxAttempts} consecutive failed reconnect attempts — tools unregistered; reload the plugin or restart the Host to reconnect`)
       return
     }
     const delayMs = Math.min(policy.maxDelayMs, policy.initialDelayMs * 2 ** (failedAttempts - 1))
     const action = lostEstablishedConnection ? 'connection lost; reconnecting' : 'connection failed; retrying'
     ctx.logger.warn(`${label}: ${action} in ${delayMs}ms (attempt ${failedAttempts}/${policy.maxAttempts})`)
+    stateTracker.backoff(Date.now() + delayMs)
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined
       settling = connectGeneration(false)
@@ -235,6 +261,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
    * @param startup - Whether this is the plugin's activation attempt.
    */
   async function connectGeneration(startup: boolean): Promise<void> {
+    stateTracker.connecting()
     const generation = new Client(
       { name: 'dsh-mcp-client', version: '0.0.1' },
       { capabilities: {} },
@@ -245,6 +272,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     const hasClosed = (): boolean => closeObserved
     client = generation
     clientClosed = closed.promise
+    currentStdioTransport = undefined
     generation.onclose = () => {
       closeObserved = true
       closed.resolve()
@@ -268,8 +296,19 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
         }
       },
     )
+    let transportResult: ReturnType<typeof createTransport> | undefined
     try {
-      await generation.connect(createTransport(config))
+      transportResult = createTransport(config, authHandle?.provider)
+      const result = transportResult
+      currentStdioTransport = result.stdioTransport
+      // Capture stderr from stdio servers into the state tracker so crash
+      // traces and config errors are visible in the UI via stderrTail.
+      if (result.stdioTransport?.stderr) {
+        result.stdioTransport.stderr.on('data', (chunk: Buffer) => {
+          stateTracker.pushStderr(chunk.toString('utf8'))
+        })
+      }
+      await generation.connect(result.transport)
       if (hasClosed()) {
         attemptSettled = true
         generationDown(generation)
@@ -277,7 +316,55 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
       }
       await enqueueSync(generation, startup ? startupOpts : opts)
     } catch (error) {
+      // OAuth redirect: the SDK called redirectToAuthorization and threw
+      // UnauthorizedError. Wait for the user to authorize in the browser,
+      // then call finishAuth on the SAME transport and retry connect.
+      if (error instanceof UnauthorizedError && authHandle !== undefined && !disposed) {
+        const authUrl = authHandle.authorizationUrl
+        if (authUrl !== undefined) {
+          ctx.logger.info(`${label}: OAuth authorization required — waiting for browser callback`)
+          stateTracker.awaitingAuth(authUrl.toString())
+          try {
+            const code = await authHandle.callbackServer.code
+            if (disposed) return
+            // finishAuth exchanges the code for tokens on the same transport
+            // that started the auth flow. The transport holds the PKCE and
+            // resource metadata from the initial discovery.
+            // transportResult is always set: createTransport runs before
+            // generation.connect, and this catch path runs after connect throws.
+            const transport = (transportResult as NonNullable<typeof transportResult>)
+              .transport as StreamableHTTPClientTransport
+            await transport.finishAuth(code)
+            if (disposed) return
+            // Retry this generation from the top: fresh client + transport
+            // (the SDK binds a Protocol to one transport for life, so we
+            // cannot reuse the generation that threw).
+            attemptSettled = true
+            settling = connectGeneration(startup)
+            return
+          } catch (authError) {
+            // Auth callback failed (user denied, timeout, etc.) — fall
+            // through to normal failure handling.
+            if (firstAttemptError === undefined) firstAttemptError = authError
+            stateTracker.failed(String(authError))
+            if (isCurrent(generation)) ctx.logger.warn(`${label}: OAuth authorization failed: ${String(authError)}`)
+            try { await generation.close() } catch { /* transport already gone */ }
+            const quiesced = hasClosed() || await waitForClose(closed.promise)
+            attemptSettled = true
+            if (!isCurrent(generation)) return
+            if (!quiesced) {
+              client = undefined
+              clientClosed = undefined
+              currentStdioTransport = undefined
+              return
+            }
+            generationDown(generation)
+            return
+          }
+        }
+      }
       if (firstAttemptError === undefined) firstAttemptError = error
+      stateTracker.failed(String(error))
       // Disposal clears current ownership before it closes the generation, so
       // only a live supervisor reports an attempt failure.
       if (isCurrent(generation)) ctx.logger.warn(`${label}: connection attempt failed: ${String(error)}`)
@@ -288,6 +375,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
       if (!quiesced) {
         client = undefined
         clientClosed = undefined
+        currentStdioTransport = undefined
         ctx.logger.error(`${label}: failed generation did not close within ${GENERATION_CLOSE_TIMEOUT_MS}ms — reconnect stopped to avoid overlapping server processes; reload the plugin or restart the Host to retry`)
         return
       }
@@ -301,6 +389,8 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
     }
     if (!isCurrent(generation)) return
     connectedAt = Date.now()
+    const pid = currentStdioTransport?.pid ?? undefined
+    stateTracker.connected(connectedAt, pid)
     if (failedAttempts > 0) ctx.logger.info(`${label}: reconnected and re-synced tools (attempt ${failedAttempts}/${policy.maxAttempts})`)
   }
 
@@ -324,6 +414,9 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
 
   return {
     ready,
+    state(): Readonly<McpClientState> {
+      return stateTracker.state
+    },
     async dispose(): Promise<void> {
       disposed = true
       if (reconnectTimer !== undefined) {
@@ -334,6 +427,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
       const currentClosed = clientClosed
       client = undefined
       clientClosed = undefined
+      currentStdioTransport = undefined
       if (current !== undefined) {
         try { await current.close() } catch { /* transport already gone */ }
         if (currentClosed !== undefined && !await waitForClose(currentClosed)) {
@@ -346,6 +440,7 @@ export function startConnection(ctx: Context, config: Config, policy: ResolvedRe
       await syncChain
       for (const dispose of disposers.values()) dispose()
       disposers = new Map()
+      stateTracker.disposed()
     },
   }
 }

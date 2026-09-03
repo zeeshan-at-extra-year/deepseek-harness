@@ -1130,10 +1130,11 @@ describe('createTransport', () => {
       toolCallTimeoutMs: 60_000,
       failOnStartupError: false,
     }
-    const transport = createTransport(config)
-    expect(transport).toBeDefined()
-    expect(transport).toHaveProperty('start')
-    expect(transport).toHaveProperty('close')
+    const result = createTransport(config)
+    expect(result.transport).toBeDefined()
+    expect(result.transport).toHaveProperty('start')
+    expect(result.transport).toHaveProperty('close')
+    expect(result.stdioTransport).toBeDefined()
   })
 
   it('creates StreamableHTTPClientTransport for http config without headers', () => {
@@ -1145,10 +1146,11 @@ describe('createTransport', () => {
       toolCallTimeoutMs: 60_000,
       failOnStartupError: false,
     }
-    const transport = createTransport(config)
-    expect(transport).toBeDefined()
-    expect(transport).toHaveProperty('start')
-    expect(transport).toHaveProperty('close')
+    const result = createTransport(config)
+    expect(result.transport).toBeDefined()
+    expect(result.transport).toHaveProperty('start')
+    expect(result.transport).toHaveProperty('close')
+    expect(result.stdioTransport).toBeUndefined()
   })
 
   it('creates StreamableHTTPClientTransport for http config with headers', () => {
@@ -1160,10 +1162,11 @@ describe('createTransport', () => {
       toolCallTimeoutMs: 60_000,
       failOnStartupError: false,
     }
-    const transport = createTransport(config)
-    expect(transport).toBeDefined()
-    expect(transport).toHaveProperty('start')
-    expect(transport).toHaveProperty('close')
+    const result = createTransport(config)
+    expect(result.transport).toBeDefined()
+    expect(result.transport).toHaveProperty('start')
+    expect(result.transport).toHaveProperty('close')
+    expect(result.stdioTransport).toBeUndefined()
   })
 
   it('scrubs sensitive env vars and forwards the rest', () => {
@@ -1186,8 +1189,8 @@ describe('createTransport', () => {
       }
       // StdioClientTransport keeps its env private; the observable contract is
       // that createTransport(config) returns a transport without throwing.
-      const transport = createTransport(config)
-      expect(transport).toBeDefined()
+      const result = createTransport(config)
+      expect(result.transport).toBeDefined()
     } finally {
       delete process.env.SAFE_VAR
       delete process.env.MY_SECRET
@@ -1210,8 +1213,8 @@ describe('createTransport', () => {
       toolCallTimeoutMs: 60_000,
       failOnStartupError: false,
     }
-    const transport = createTransport(config)
-    expect(transport).toBeDefined()
+    const result = createTransport(config)
+    expect(result.transport).toBeDefined()
   })
 })
 
