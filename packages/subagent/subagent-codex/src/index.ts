@@ -12,7 +12,7 @@ import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import {
   assertPositiveFinite,
   NO_START_CAPABILITIES,
-  resolveChildCwd,
+  assertUsableCwd,
   type ResolvedSubagentStartRequest,
   type SubagentCapabilities,
   type SubagentProvider,
@@ -45,7 +45,7 @@ export interface Config {
   env?: Record<string, string>
   /** Native non-interactive permission mode fixed for this Provider instance. */
   permissionMode?: CodexPermissionMode
-  /** Grace in milliseconds for app-server process-tree termination. */
+  /** Grace in milliseconds between app-server managed-range termination tiers. */
   disposeGraceMs?: number
 }
 
@@ -71,19 +71,9 @@ class CodexProvider implements SubagentProvider {
   ) {}
 
   start(request: ResolvedSubagentStartRequest) {
-    const parentCwd = request.parent.session.header.cwd
-    if (parentCwd === undefined) {
-      throw new Error(
-        'subagent-codex: no working directory for the child — delegate from a parent session that has one',
-      )
-    }
     let cwd: string
     try {
-      cwd = resolveChildCwd(
-        'subagent-codex',
-        undefined,
-        parentCwd,
-      )
+      cwd = assertUsableCwd('subagent-codex', 'child cwd', request.cwd)
     } catch (error: unknown) {
       if (request.signal.aborted) {
         throw new Error(

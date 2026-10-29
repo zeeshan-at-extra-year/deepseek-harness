@@ -15,38 +15,28 @@ const { mockConnect, mockClose, mockListTools, MockClient, instances } = vi.hois
   const mockConnect = vi.fn<() => Promise<void>>()
   const mockClose = vi.fn<() => Promise<void>>()
   const mockListTools = vi.fn<(_params?: Record<string, unknown>) => Promise<unknown>>()
-  const mockSetNotificationHandler = vi.fn()
-  const mockRequest = vi.fn(async (
-    request: { method: string; params?: Record<string, unknown> },
-    _schema: unknown,
-    _options?: unknown,
-  ): Promise<unknown> => {
-    if (request.method === 'tools/list') return await mockListTools(request.params)
-    if (request.method === 'tools/call') return { content: [{ type: 'text', text: 'ok' }] }
-    throw new Error(`unexpected MCP request: ${request.method}`)
-  })
   class MockClient {
     onclose: (() => void) | undefined
+    /** Truthy transport makes the supervisor treat the generation as attached, exercising `Client.close()`. */
+    transport: Record<string, never> = {}
     connect = mockConnect
     close = mockClose
-    request = mockRequest
-    setNotificationHandler = mockSetNotificationHandler
+    listTools = mockListTools
+    getServerCapabilities = () => ({ tools: {} })
+    getInstructions(): string | undefined { return undefined }
     constructor() { instances.push(this) }
   }
   const instances: MockClient[] = []
   return { mockConnect, mockClose, mockListTools, MockClient, instances }
 })
 
-vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
+vi.mock('@modelcontextprotocol/client', async importOriginal => ({
+  ...await importOriginal<typeof import('@modelcontextprotocol/client')>(),
   Client: MockClient,
 }))
 
-vi.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
+vi.mock('@modelcontextprotocol/client/stdio', () => ({
   StdioClientTransport: vi.fn(),
-}))
-
-vi.mock('@modelcontextprotocol/sdk/client/streamableHttp.js', () => ({
-  StreamableHTTPClientTransport: vi.fn(),
 }))
 
 import { apply } from '@deepseek-ai/dsh-mcp-client/src/index.ts'

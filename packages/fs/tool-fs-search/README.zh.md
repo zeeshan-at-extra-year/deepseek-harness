@@ -1,5 +1,5 @@
 ---
-description: "面向模型的 glob 与 grep 发现工具：供组合或排查 agent 工作区搜索的用户与维护者使用。"
+description: "面向模型的 glob 与 grep 发现工具：供组合或排查 agent（智能体）工作区搜索的用户与维护者使用。"
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`dsh-tool-fs-search` 提供面向模型的文件系统发现工具——`glob` 与 `grep`——由打包的 ripgrep 二进制支持，因此既不需要宿主 `rg` 安装，也不需要文件系统后端。每次调用都由 ripgrep 自身以固定参数集执行，并返回相对于工作目录的结果；由于每种载体都打包 ripgrep，工具始终可用。结果受可配置上限约束，达到上限的结果会在挂载可选 spill 存储时完整保存。当模型需要按模式发现文件或搜索文件内容时选择本包；文本文件的读取、写入与编辑是同级 `dsh-tool-fs` 包的职责。
+使用 `dsh-tool-fs-search` 为模型提供本地工作区中的 `glob` 文件发现与 `grep` 内容搜索。搜索无需在宿主上安装 `rg`，也无需文件系统提供方；结果相对于工作目录，并包含隐藏与忽略文件但排除 VCS 元数据。可配置上限约束内联输出；挂载可选 spill 存储后，达到上限的结果仍可完整恢复。若需读取、写入或编辑文件，请选择同级 `dsh-tool-fs` 包。
 
 ## 目录
 
@@ -24,6 +24,8 @@ kind: "package-reference"
 
 <a id="use-this-package"></a>
 ## 使用本包
+
+搜索使用 Session 的当前工作目录，包括通过 `working_directory` 切换后的目录。
 
 在 `ctx.subprocess` 后端之后挂载工具；无需宿主 `rg` 安装，也无需文件系统提供方。模型随后获得按修改时间排序的文件发现与按行组织的内容搜索，两者都有界并受超时防护。
 
@@ -46,7 +48,7 @@ kind: "package-reference"
 | 工具 | 参数 | 行为 |
 |---|---|---|
 | `glob` | `pattern`、`path?` | 查找路径匹配 glob 模式的文件，包含隐藏与忽略文件但排除 VCS 元数据；不含 `/` 的模式匹配任意深度的基名，因此 `*` 匹配整棵树；完整结果保持按修改时间排序 |
-| `grep` | `pattern`、`path?`、`include?` | 用 ripgrep 正则搜索文件内容，并按文件分组返回 `Line N: <preview>` 匹配；`include` 是一个正向 glob 过滤器，逗号分隔列表与否定值会被前置拒绝 |
+| `grep` | `pattern`、`path?`、`include?` | 用 ripgrep 正则搜索文件内容，并按文件分组返回 `Line N: <preview>` 匹配；省略 `include` 或传入空字符串时不限制文件类型；否则 `include` 是一个正向 glob 过滤器，仅含空白的值、逗号分隔列表与否定值会被前置拒绝 |
 
 常规预算不进入面向模型的 schema：需要周边上下文的模型用 `read` 读取匹配文件，需要后续结果的模型遵循返回的 spill locator 检索提示。
 
@@ -70,7 +72,7 @@ kind: "package-reference"
 
 ### 部署要求
 
-Node 部署在受支持的 macOS、Linux 与 Windows 目标上获得 `@vscode/ripgrep` 平台包；Python SDK wheel 把目标原生二进制复制到单文件运行时旁，作为 `-rg` 伴随文件。两种载体均不要求宿主安装 `rg`。返回路径相对于解析后的工作目录显示（有会话 cwd 时使用会话 cwd），只有该工作目录与文件系统根目录是同一工作区时，才能用 `read` 继续读取。
+Node 部署在受支持的 macOS、Linux 与 Windows 目标上获得 `@vscode/ripgrep` 平台包；Python SDK 的 wheel 包把目标原生二进制复制到单文件运行时旁，作为 `-rg` 伴随文件。两种载体均不要求宿主安装 `rg`。返回路径相对于解析后的工作目录显示（有会话 cwd 时使用会话 cwd），只有该工作目录与文件系统根目录是同一工作区时，才能用 `read` 继续读取。
 
 ### 失败与恢复
 
@@ -103,7 +105,24 @@ Node 部署在受支持的 macOS、Linux 与 Windows 目标上获得 `@vscode/ri
 
 ### 搜索如何运行
 
+未显式提供 `path` 时，如果目录部分的每一项都是普通相对名称且不属于 VCS 元数据目录，`glob` 会为 `packages/core/src/*.ts` 这样的模式跳过无关子树。按顺序添加的 ripgrep glob 先排除目录树，再按前缀中去重后的名称放行目录，最后应用原始文件模式。其他位置的同名目录也可能被遍历，但文件仍只按原模式匹配。新增参数上限为 8 KiB，超过时沿用原遍历方式。搜索根目录、路径分隔符、符号链接处理、匹配规则和修改时间排序保持不变；其他模式仍按原方式遍历。
+
 每次调用解析打包二进制（`@vscode/ripgrep`，或 pkg 单文件运行时中可执行程序的 `-rg` 伴随文件），前置 `--no-config`，使宿主的 `RIPGREP_CONFIG_PATH` 无法向不受约束的 spawn 注入 `--pre` 预处理器，并把每个模型控制的值作为普通 argv 元素传入——不存在 shell 层，因此不涉及 shell 引号处理。collect 模式预算限制完整 stdout 与 stderr 尾部；lossy stdout 读取以 `SEARCH_RAW_OUTPUT_OVERFLOW` 失败，而不是解析静默不完整的流。工具从不读取原始 spill 路径。
+
+### Native 模式 benchmark
+
+运行 `pnpm run build` 后，将包内诊断脚本编译为外部引用运行时依赖的产物，再用普通 Node 运行：
+
+```sh
+cd packages/fs/tool-fs-search
+node --input-type=module <<'JS'
+import { build } from 'tsdown';
+await build({ config: false, tsconfig: false, dts: false, entry: 'tests/glob-native.perf.ts', outDir: 'tests/.dsh-build', clean: false, deps: { neverBundle: [/^[^./]/] } });
+JS
+node tests/.dsh-build/glob-native.perf.mjs
+```
+
+诊断脚本创建 20,000 个无关文件和六个匹配文件，然后通过 Native executor 测量五次 `ctx.tools.execute()` 调用，使用真实 Agent、工作目录服务和本地 subprocess 后端。输出包括原始耗时、中位数，以及完整值、文本和展示元数据的哈希。`--plugin <built-module>` 选择其他搜索包版本；`--workspace <directory>` 显式选择只读的现有工作区，替代合成目录。计时排除初始化、模型生成、UI 和 Session 持久化；不设耗时阈值。
 
 ### 两类预算、两类产物
 
@@ -134,18 +153,12 @@ Node 部署在受支持的 macOS、Linux 与 Windows 目标上获得 `@vscode/ri
 
 #### 模型看到的内容
 
-该插件注册作用域内的每个请求都包含下方独立注册的 glob 与 grep 指导。agent 作用域的工具限制可以隐藏任一 schema，而不移除其提示词段。
+组装时，每个段落通过 `ctx.tools.get(name, scope)` 检查对应工具，仅在其可见时输出。grep 段落仅在 read 可见时包含后续使用 read 的句子。同一受支持工具集合下，原文和段落顺序保持不变，包括通过 `run_code` 暴露的 PTC 能力。 这种按 scope 选择文本的机制适用于系统提示词段落。工具 schema 描述仍是注册时的文本，不提及其他工具。
 
-##### 启用 `sampleOverCapGlobResults: true` 时的 Glob 指导
-
-```markdown
-Use the glob tool — not shell find — to discover files by path pattern. A pattern with no "/" matches basenames at any depth, so "*" matches every file in the tree rather than its top level. Results are files only, never directories, and include hidden and ignored files: a result that fits comes back in modification-time order, while a larger one is sampled across top-level entries, so it spans the tree instead of one subtree.
-```
-
-##### 启用 `sampleOverCapGlobResults: false` 时的 Glob 指导
+##### Glob 指导
 
 ```markdown
-Use the glob tool — not shell find — to discover files by path pattern. A pattern with no "/" matches basenames at any depth, so "*" matches every file in the tree rather than its top level. Results are files only, never directories, and include hidden and ignored files: a result that fits comes back in modification-time order, while a larger one keeps the modification-time-ordered head.
+Use the glob tool — not shell find — to discover files by path pattern.
 ```
 
 ##### Grep 指导
@@ -156,11 +169,11 @@ Use the grep tool — not shell grep or rg — to search file contents. Use read
 
 #### Token 影响
 
-工具注册期间每个请求有固定的指导成本；必填的采样选择决定采用哪一个 glob 变体。
+指导成本取决于可见工具；必填的采样选择决定采用哪一个 glob 变体。
 
 #### KV Cache 影响
 
-插件作用域、采样选择与指导文本不变时前缀稳定。激活、dispose（资源释放）或改变选择可能使该提示词段的复用失效。
+可见工具集合、插件作用域、采样选择与指导文本不变时前缀稳定。限制、激活、dispose（资源释放）或改变选择可能从首个变化的段落开始使复用失效。
 
 ### 工具 schema
 
@@ -213,6 +226,7 @@ glob 描述声明了配置的超过上限排序方式。生成的 [`glob` 和 `g
 
 - **搜索与文件访问没有共享工作区证明**——只有当工作目录与文件系统根目录指向同一工作区时，返回路径才可继续读取；本包不执行运行时跨服务校验。
 - **打包二进制固定在依赖版本上**——Node 部署使用 `@vscode/ripgrep` 选择的版本；Python 单文件运行时将对应目标的原生版本复制为必需的 `-rg` 伴随文件。不支持的平台或损坏的安装会以 `SEARCH_FAILED` 使调用失败，Python 运行时包则会在启动前拒绝缺少伴随文件的安装。远程或虚拟文件系统需要共置的工作区或另一个搜索消费方。
+- **目录通配符仍遍历工作区**——`src/**/*.ts` 这样的模式不会自动缩小遍历根目录；可显式提供 `path` 来限定范围。
 - **schema 只暴露一个有界页面**——偏移分页、大小写开关、替代输出模式与提供方支撑的发现仍不在本包范围内；达到上限的完整输出需要 spill 后端。
 - **启用采样时仅按搜索根正下方的第一段路径分组**——超过上限的 `glob` 页面在这些顶层条目之间平衡，因此集中在更深处的结果在该层级之下仍会呈现不均；递归平衡被延期。
 
@@ -225,5 +239,3 @@ glob 描述声明了配置的超过上限排序方式。生成的 [`glob` 和 `g
 无。
 
 </details>
-
-**运行时不变式：** 不发布伴生入口。这个模型侧 adapter 没有独立 lifecycle stream；执行关系由它调用的 capability seam 负责。

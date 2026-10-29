@@ -5,6 +5,7 @@ import type {
   ISessions, SessionBinding, SessionEventSource, SessionEventWindow,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session/types'
+import { WeakMapWithValues } from '@deepseek-ai/dsh-util-values'
 import {
   createSnapshotStore, type ObservableSnapshot, type SnapshotStore,
 } from '@deepseek-ai/dsh-client-store'
@@ -13,16 +14,27 @@ import type {
   ConversationViewSnapshotStore,
 } from '../contract/conversation.ts'
 import type { ConversationSnapshot } from '../contract/snapshot.ts'
-import type { ConversationPromptSnapshot, RequestPromptInspection } from '../contract/request-inspection.ts'
+import type {
+  ConversationPromptSnapshot, RequestPromptInspection, SystemPromptNode,
+} from '../contract/request-inspection.ts'
 import { inspectRequestPrompt } from '../contract/request-inspection.ts'
+import { inspectSystemPrompt, type SystemPromptState } from '../contract/system-prompt.ts'
 import { ConversationNodeAssembler } from './assembler.ts'
 import { ConversationEventRegistry } from './event-registry.ts'
 import { HistoricalImageCache } from './historical-images.ts'
 import { ConversationViewRegistry } from './view-registry.ts'
+import { ConversationGroupRegistry } from './group-registry.ts'
+import { ConversationInteractionRegistry } from './interaction-registry.ts'
+import { UserTextRegistry } from './user-text-registry.ts'
 
 /** Observable faces published for one Session's Conversation assembly. */
 export interface ConversationBinding {
   readonly snapshot: ObservableSnapshot<ConversationSnapshot>
+  /**
+   * Identity-stable source of the latest turn number, undefined unless its start is loaded and it remains open.
+   * Turn changes publish synchronously, including without an active View.
+   */
+  readonly openTurn: ObservableSnapshot<number | undefined>
   /**
    * Add one selected target to the Session's monotonic active set.
    * @param target - registered or subsequently registered Conversation target.
@@ -42,6 +54,7 @@ export interface ConversationBinding {
 
 class BoundConversation implements ConversationBinding {
   readonly snapshot: SnapshotStore<ConversationSnapshot>
+  readonly openTurn: SnapshotStore<number | undefined>
   private readonly viewStore: ConversationViewSnapshotStore
   private readonly targetSources = new Map<string, ObservableSnapshot<unknown>>()
   private revision = -1
@@ -54,6 +67,7 @@ class BoundConversation implements ConversationBinding {
   ) {
     this.viewStore = assembler
     this.snapshot = createSnapshotStore(this.currentSnapshot())
+    this.openTurn = createSnapshotStore(assembler.openTurn())
     this.replace(feed.getSnapshot())
     this.disposeFeed = feed.subscribe(() => {
       this.accept(feed.getSnapshot())
@@ -65,7 +79,7 @@ class BoundConversation implements ConversationBinding {
   ): ObservableSnapshot<ConversationViewSnapshotMap[Target] | undefined> {
     let source = this.targetSources.get(target)
     if (source === undefined) {
-      const views = this.viewStore as unknown as { get(key: string): unknown }
+      const views = this.viewStore as { get(key: string): unknown }
       source = {
         getSnapshot: () => views.get(target),
         subscribe: (listener) => {
@@ -81,6 +95,7 @@ class BoundConversation implements ConversationBinding {
 
   activate(target: string): void {
     if (this.assembler.activateTarget(target)) this.snapshot.set(this.currentSnapshot())
+    this.openTurn.set(this.assembler.openTurn())
   }
 
   rebuild(): void { this.publish(this.assembler.rebuildRegistry()) }
@@ -113,7 +128,14 @@ class BoundConversation implements ConversationBinding {
           if (next === 'immediate' || publication === 'none') publication = next
         }
         this.publish(publication)
+        return
       }
+      case 'settle-assistant':
+        this.publish(this.assembler.settleAssistant(
+          window.change.attemptId,
+          window.change.entry,
+        ))
+        return
     }
   }
 
@@ -145,6 +167,7 @@ class BoundConversation implements ConversationBinding {
 
   private flush(): void {
     if (this.assembler.flush()) this.snapshot.set(this.currentSnapshot())
+    this.openTurn.set(this.assembler.openTurn())
   }
 
   private currentSnapshot(): ConversationSnapshot {
@@ -167,7 +190,13 @@ export class UiConversation extends Service {
   readonly events: ConversationEventRegistry
   /** Registry of target View definitions. */
   readonly views: ConversationViewRegistry
-  private readonly bindings = new Map<SessionId, BindingRecord>()
+  /** Business grouping rules over already materialized target Nodes. */
+  readonly groups: ConversationGroupRegistry
+  /** Pure text rules and parser snapshots, independent of durable Session assembly. */
+  readonly userText: UserTextRegistry
+  /** Plugin-owned handlers for selection and context-menu gestures. */
+  readonly interactions: ConversationInteractionRegistry
+  private readonly bindings = new WeakMapWithValues<SessionBinding, BindingRecord>()
   private readonly images: HistoricalImageCache
 
   /**
@@ -178,9 +207,12 @@ export class UiConversation extends Service {
     super(ctx, 'uiConversation')
     this.events = new ConversationEventRegistry(ctx)
     this.views = new ConversationViewRegistry(ctx)
+    this.groups = new ConversationGroupRegistry(ctx, this.views)
+    this.userText = new UserTextRegistry(ctx)
+    this.interactions = new ConversationInteractionRegistry(ctx)
     this.images = new HistoricalImageCache(ctx, sessions)
     const rebuild = (): void => {
-      for (const record of this.bindings.values()) record.binding.rebuild()
+      for (const record of this.bindings.values) record.binding.rebuild()
     }
     let rebuildQueued = false
     const scheduleRebuild = (): void => {
@@ -194,10 +226,12 @@ export class UiConversation extends Service {
     ctx.effect(() => {
       const disposeEvents = this.events.subscribe(scheduleRebuild)
       const disposeViews = this.views.subscribe(scheduleRebuild)
+      const disposeGroups = this.groups.subscribe(scheduleRebuild)
       return () => {
+        disposeGroups()
         disposeViews()
         disposeEvents()
-        for (const record of [...this.bindings.values()]) this.drop(record, true)
+        for (const record of [...this.bindings.values]) this.drop(record, true)
       }
     }, 'ui-conversation assembly')
   }
@@ -206,20 +240,23 @@ export class UiConversation extends Service {
    * Resolve the Conversation binding for one Controller binding or Session id.
    * @param source - Session binding or identity.
    * @returns stable Conversation binding.
+   * @throws if the Session is unknown or its binding is no longer current.
    */
   binding(source: SessionBinding | SessionId): ConversationBinding {
     const sessionId = typeof source === 'string' ? source : source.sessionId
     const owner = typeof source === 'string' ? this.sessions.binding(source) : source
     if (owner === undefined) throw new Error(`uiConversation.binding: unknown session "${sessionId}"`)
-    const current = this.bindings.get(owner.sessionId)
-    if (current?.source === owner) return current.binding
-    if (current !== undefined) this.drop(current, true)
+    if (this.sessions.binding(sessionId) !== owner) {
+      throw new Error(`uiConversation.binding: inactive session "${sessionId}"`)
+    }
+    const current = this.bindings.get(owner)
+    if (current !== undefined) return current.binding
     const binding = new BoundConversation(
       owner.eventSource,
-      new ConversationNodeAssembler(this.events, this.views),
+      new ConversationNodeAssembler(this.events, this.views, this.groups),
     )
     const record: BindingRecord = { source: owner, binding, disposeScope: () => {} }
-    this.bindings.set(owner.sessionId, record)
+    this.bindings.set(owner, record)
     const disposeScope = owner.ctx.effect(
       () => () => { this.drop(record, false) },
       'ui-conversation binding',
@@ -229,9 +266,9 @@ export class UiConversation extends Service {
   }
 
   /**
-   * Resolve one session-authorized durable image URL, cached per Session so
+   * Resolve one Gateway-authorized durable image URL, cached per Session so
    * every Conversation target shares one read and one browser URL.
-   * @param sessionId - Session authorization and lifetime scope.
+   * @param sessionId - Session binding that owns the cached URL lifetime.
    * @param attachment - Durable image reference from a session event.
    * @returns browser URL valid until the Session binding is released.
    */
@@ -241,7 +278,7 @@ export class UiConversation extends Service {
 
   /**
    * Read a cached durable image URL synchronously when one is available.
-   * @param sessionId - Session authorization and lifetime scope.
+   * @param sessionId - Session binding that owns the cached URL lifetime.
    * @param attachment - Durable image reference from a session event.
    * @returns current preview or canonical URL, if cached.
    */
@@ -253,7 +290,7 @@ export class UiConversation extends Service {
    * Adopt an already-displayable URL for one durable reference (see
    * HistoricalImageCache.seed): the transcript node then renders it without a
    * byte round-trip.
-   * @param sessionId - Session authorization and lifetime scope.
+   * @param sessionId - Session binding that owns the cached URL lifetime.
    * @param attachment - Durable image reference the URL displays.
    * @param url - browser URL to adopt.
    * @returns whether the cache took URL ownership.
@@ -263,25 +300,38 @@ export class UiConversation extends Service {
   }
 
   /**
-   * Canonicalize one `request/header` event against the previous prompt state.
+   * Interpret a system message or surface replacement for target-owned prompt Definitions.
+   * @param previous - System facts at the preceding relevant loaded event.
+   * @param event - Durable system message or positional replacement.
+   * @returns Immutable prompt interpretation at this event.
+   */
+  inspectSystemPrompt(previous: SystemPromptState | undefined, event: SessionEvent): SystemPromptState {
+    return inspectSystemPrompt(previous, event)
+  }
+
+  /**
+   * Canonicalize one `request/header` event against the previous prompt state
+   * and the `system/message` node in force.
    *
    * A pure interpretation shared by the Chat and Trajectory Definitions, exposed
    * as a service method because cross-plugin value imports are forbidden in
    * client bundles.
    * @param previous - prompt recorded by the preceding loaded header, if any.
    * @param event - the `request/header` session event to interpret.
+   * @param system - effective prompt after loaded surface replacements, if any.
    * @returns the canonical prompt snapshot and any model-visible change.
    */
   inspectRequestPrompt(
     previous: ConversationPromptSnapshot | undefined,
     event: SessionEvent<'request/header'>,
+    system: SystemPromptNode | undefined,
   ): RequestPromptInspection {
-    return inspectRequestPrompt(previous, event)
+    return inspectRequestPrompt(previous, event, system)
   }
 
   private drop(record: BindingRecord, releaseScope: boolean): void {
-    if (this.bindings.get(record.source.sessionId) !== record) return
-    this.bindings.delete(record.source.sessionId)
+    if (this.bindings.get(record.source) !== record) return
+    this.bindings.delete(record.source)
     record.binding.dispose()
     if (releaseScope) record.disposeScope()
   }

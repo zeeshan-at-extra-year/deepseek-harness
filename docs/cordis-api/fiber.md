@@ -80,11 +80,11 @@ The context this fiber's plugin runs in (extends the parent context).
 ### fiber.config
 
 ```ts cordis-catalog
-/** The validated plugin config (updated by `update()`). */
+/** The validated plugin config (updated by `update()`); read through {@link effectiveConfig}. */
 public config: any
 ```
 
-The validated plugin config (updated by `update()`).
+The validated plugin config (updated by `update()`); read through effectiveConfig.
 
 [Source](../../vendor/cordis/src/fiber.ts#L190)
 
@@ -209,6 +209,53 @@ Return metadata for currently registered effects.
 
 [Source](../../vendor/cordis/src/fiber.ts#L568)
 
+### fiber.rawConfig
+
+```ts cordis-catalog
+/** Raw input retained for the next activation, without evaluating expressions or validating it. */
+get rawConfig(): unknown
+```
+
+Raw input retained for the next activation, without evaluating expressions or validating it.
+
+[Source](../../vendor/cordis/src/fiber.ts#L642)
+
+### fiber.effectiveConfig
+
+```ts cordis-catalog
+/**
+ * The config object published by the existing activation/update lifecycle, without cloning or re-parsing.
+ * It is undefined before the first resolution and remains readable after unload; callers requiring a live instance check `state`.
+ */
+get effectiveConfig(): unknown
+```
+
+The config object published by the existing activation/update lifecycle, without cloning or re-parsing. It is undefined before the first resolution and remains readable after unload; callers requiring a live instance check `state`.
+
+[Source](../../vendor/cordis/src/fiber.ts#L655)
+
+### fiber.resolveConfig(config)
+
+```ts cordis-catalog
+/**
+ * Evaluate and validate a candidate using this fiber's `internal/config` hooks and runtime schema.
+ * Does not publish the result, replace raw input, or commit running volatile references.
+ * Required injections must be available when a hook uses them.
+ * @param config Raw candidate input.
+ * @returns The candidate's resolved config, retaining the schema's result identity.
+ * @throws {ValidationError} when the runtime schema rejects the candidate; hook errors propagate.
+ */
+resolveConfig(config: unknown): unknown
+```
+
+Evaluate and validate a candidate using this fiber's `internal/config` hooks and runtime schema. Does not publish the result, replace raw input, or commit running volatile references. Required injections must be available when a hook uses them.
+
+- `config` — Raw candidate input.
+
+**Returns** The candidate's resolved config, retaining the schema's result identity.
+
+[Source](../../vendor/cordis/src/fiber.ts#L667)
+
 ### fiber.await()
 
 ```ts cordis-catalog
@@ -225,7 +272,7 @@ Wait for current lifecycle work and rethrow startup errors.
 
 **Returns** this fiber, once it has settled into a stable state.
 
-[Source](../../vendor/cordis/src/fiber.ts#L704)
+[Source](../../vendor/cordis/src/fiber.ts#L731)
 
 ### fiber.restart()
 
@@ -243,7 +290,7 @@ Dispose and immediately reload this plugin with its current config.
 
 **Returns** a promise resolving once the reload settled.
 
-[Source](../../vendor/cordis/src/fiber.ts#L718)
+[Source](../../vendor/cordis/src/fiber.ts#L745)
 
 ### fiber.update(config, noSave?)
 
@@ -256,8 +303,8 @@ Dispose and immediately reload this plugin with its current config.
  *
  * @param config — the new raw config; validated before anything restarts.
  * @param noSave — hint for persistence hooks not to write the change back.
- * @returns the update waterfall result; the default restart returns a promise.
- * @throws when validation, an update listener, or the restarted plugin fails.
+ * @returns nothing; the restart runs behind the `internal/update` waterfall.
+ * @throws {ValidationError} when the new config fails validation.
  */
 update(config: any, noSave = false)
 ```
@@ -269,9 +316,9 @@ Runs the `internal/update` waterfall first, so update hooks (and HMR) can veto o
 - `config` — the new raw config; validated before anything restarts.
 - `noSave` — hint for persistence hooks not to write the change back.
 
-**Returns** the update waterfall result; the default restart returns a promise.
+**Returns** nothing; the restart runs behind the `internal/update` waterfall.
 
-[Source](../../vendor/cordis/src/fiber.ts#L736)
+[Source](../../vendor/cordis/src/fiber.ts#L764)
 
 ## Effect
 

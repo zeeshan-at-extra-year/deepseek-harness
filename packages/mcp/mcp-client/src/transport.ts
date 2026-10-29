@@ -6,10 +6,9 @@
  * @module
  */
 
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
-import type { OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
+import type { OAuthClientProvider, Transport } from '@modelcontextprotocol/client'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
+import { StdioClientTransport } from '@modelcontextprotocol/client/stdio'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type { Config } from './index.ts'
 
@@ -23,12 +22,17 @@ function buildChildEnv(extra: Record<string, string>): Record<string, string> {
   return { ...scrubbedParentEnv(), ...extra }
 }
 
-/** Result of creating an MCP transport, including transport-specific metadata. */
+/**
+ * Result of creating an MCP transport, including transport-specific metadata
+ * the supervisor needs beyond the plain connect target.
+ */
 export interface TransportResult {
   /** The MCP transport ready for `client.connect()`. */
   transport: Transport
-  /** For stdio: the `StdioClientTransport` instance, exposing `.pid` after connect. */
+  /** For stdio: the `StdioClientTransport` instance, exposing `.pid` and piped `.stderr` after connect. */
   stdioTransport?: StdioClientTransport
+  /** For streamable-http: the concrete HTTP transport, exposing `finishAuth` for the OAuth callback. */
+  httpTransport?: StreamableHTTPClientTransport
 }
 
 /**
@@ -50,19 +54,15 @@ export function createTransport(config: Config, authProvider?: OAuthClientProvid
       })
       return { transport: stdioTransport, stdioTransport }
     }
-    case 'streamable-http':
-      // The MCP SDK's StreamableHTTPClientTransport has optional callback
-      // properties typed without `| undefined` (exactOptionalPropertyTypes
-      // mismatch with the Transport interface); the SDK constructed the
-      // object, so the cast records only that widening.
-      return {
-        transport: new StreamableHTTPClientTransport(
-          new URL(config.url),
-          {
-            ...authProvider !== undefined ? { authProvider } : {},
-            requestInit: { headers: config.headers },
-          },
-        ) as Transport,
-      }
+    case 'streamable-http': {
+      const httpTransport = new StreamableHTTPClientTransport(
+        new URL(config.url),
+        {
+          ...authProvider !== undefined ? { authProvider } : {},
+          requestInit: { headers: config.headers },
+        },
+      )
+      return { transport: httpTransport, httpTransport }
+    }
   }
 }

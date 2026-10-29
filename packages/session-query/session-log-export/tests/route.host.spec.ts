@@ -1,12 +1,14 @@
 import { Context } from '@deepseek-ai/cordis'
 import { HostConnectionService } from '@deepseek-ai/dsh-client-connection'
 import type { BrowserAuth } from '@deepseek-ai/dsh-client-connection/src/browser-auth.ts'
+import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHandle } from '@deepseek-ai/dsh-session-persistence'
 import { strFromU8, unzipSync } from 'fflate'
 import { describe, expect, it } from 'vitest'
 import {
   Config,
+  SESSION_LOG_FILENAME,
   SESSION_LOG_EXPORT_PATH,
   apply,
   inject,
@@ -16,7 +18,7 @@ const sid = (value: string): SessionId => value as SessionId
 
 function readHandle(id: string): SessionHandle {
   const header: SessionHeader = {
-    version: 0,
+    version: SESSION_FORMAT_VERSION,
     id: sid(id),
     createdAt: 1,
     isSeeded: false,
@@ -27,7 +29,7 @@ function readHandle(id: string): SessionHandle {
     id: header.id,
     header,
     access: 'read',
-    read: async () => [],
+    read: async () => ({ eventState: 'detached', events: [] }),
     close: async () => {},
   } as unknown as SessionHandle
 }
@@ -63,34 +65,34 @@ describe('Session log export Fetch route', () => {
 
     const response = await shared.fetch(new Request(
       `http://host${SESSION_LOG_EXPORT_PATH}?sessionId=session-1`,
-    ))
+    ), connection.browserPeer)
     expect(response.status).toBe(200)
     expect(response.headers.get('content-type')).toBe('application/zip')
     const files = unzipSync(new Uint8Array(await response.arrayBuffer()))
-    expect(strFromU8(files['session.jsonl'] as Uint8Array)).toContain('"id":"session-1"')
+    expect(strFromU8(files[SESSION_LOG_FILENAME] as Uint8Array)).toContain('"id":"session-1"')
 
     const head = await shared.fetch(new Request(
       `http://host${SESSION_LOG_EXPORT_PATH}?sessionId=session-1`, { method: 'HEAD' },
-    ))
+    ), connection.browserPeer)
     expect(head.status).toBe(200)
     expect(head.body).toBeNull()
 
     await dispose()
     expect((await shared.fetch(new Request(
       `http://host${SESSION_LOG_EXPORT_PATH}?sessionId=session-1`,
-    ))).status).toBe(404)
+    ), connection.browserPeer)).status).toBe(404)
   })
 
   it('validates the query before reporting missing export services', async () => {
     const { connection, dispose } = await mounted(false)
     const shared = connection.createSharedFetchHandler('/api')
-    expect((await shared.fetch(new Request(`http://host${SESSION_LOG_EXPORT_PATH}`))).status).toBe(400)
+    expect((await shared.fetch(new Request(`http://host${SESSION_LOG_EXPORT_PATH}`), connection.browserPeer)).status).toBe(400)
     expect((await shared.fetch(new Request(
       `http://host${SESSION_LOG_EXPORT_PATH}?sessionId=session-1&includeDescendants=1`,
-    ))).status).toBe(400)
+    ), connection.browserPeer)).status).toBe(400)
     expect((await shared.fetch(new Request(
       `http://host${SESSION_LOG_EXPORT_PATH}?sessionId=session-1`,
-    ))).status).toBe(500)
+    ), connection.browserPeer)).status).toBe(500)
     await dispose()
   })
 

@@ -1,8 +1,8 @@
 /**
  * Generate `THIRD_PARTY_NOTICES.md` from the workspace manifests: every
  * external dependency named by a workspace `package.json`, the vendored-package
- * manifest in `vendor/README.md`, the Python `pyproject.toml` files, and the
- * pnpm patch list. License and repository metadata come from the installed
+ * manifest in `vendor/README.md`, the Python `pyproject.toml` files, the shared
+ * Python distribution lock, and the pnpm patch list. npm metadata comes from the installed
  * store, so the tree must be installed. `--check` verifies the committed
  * artifact. Tier policy and ownership live in
  * `.agents/notes/implemented/process/2026-07-30-generated-third-party-notices.md`.
@@ -13,6 +13,9 @@ import { dirname, resolve } from 'node:path'
 import * as yaml from 'js-yaml'
 import { parse as parseToml, type TomlTableWithoutBigInt, type TomlValueWithoutBigInt } from 'smol-toml'
 import parseSpdx from 'spdx-expression-parse'
+import primaryRuntimeLock from './primary-runtime/lock.json' with { type: 'json' }
+import { browserBundledExternals } from './browser-bundled-externals.ts'
+import { DEVTOOLS_NPM_VERSION, DEVTOOLS_SOURCE_REVISION } from '../packages/experimental/inspector/scripts/devtools/source.ts'
 
 const root = resolve(import.meta.dirname, '..')
 const OUT = 'THIRD_PARTY_NOTICES.md'
@@ -38,17 +41,34 @@ const DEV_ONLY_AREAS = [
   'native/',
 ] as const
 
+/** Third-party implementations embedded by named Host packages' shipping build configurations. */
+const HOST_BUNDLED_DEPENDENCIES: Readonly<Record<string, readonly string[]>> = {
+  // subagent-oar/tsdown.config.ts embeds the patched adapter instead of installing a second copy.
+  '@deepseek-ai/dsh-experimental-subagent-oar': ['@botiverse/oar'],
+}
+
 /** First-party public native packages: reachable at runtime but not third-party. */
 const FIRST_PARTY = new Set([
-  '@deepseek-ai/node-addon-landlock-run',
-  '@deepseek-ai/node-addon-landlock-run-linux-arm64',
-  '@deepseek-ai/node-addon-landlock-run-linux-x64',
+  '@deepseek-ai/node-addon-system',
+  '@deepseek-ai/node-addon-system-darwin-arm64',
+  '@deepseek-ai/node-addon-system-darwin-x64',
+  '@deepseek-ai/node-addon-system-linux-arm64',
+  '@deepseek-ai/node-addon-system-linux-x64',
 ])
 
 /** Official SDK identity covered by the project's narrow owner authorization. */
 export const CLAUDE_AGENT_SDK_PACKAGE = '@anthropic-ai/claude-agent-sdk'
 const CLAUDE_PLATFORM_PACKAGE_PREFIX = `${CLAUDE_AGENT_SDK_PACKAGE}-`
 const CLAUDE_PLATFORM_DECLARED_LICENSE = 'SEE LICENSE IN LICENSE.md'
+const LIBREOFFICE_KIT_PACKAGE = '@deepseek-ai/libreoffice-kit'
+const LIBREOFFICE_PACKAGES = new Set([
+  LIBREOFFICE_KIT_PACKAGE,
+  '@deepseek-ai/libreoffice-kit-wasm',
+  '@deepseek-ai/libreoffice-kit-darwin-arm64',
+  '@deepseek-ai/libreoffice-kit-darwin-x64',
+  '@deepseek-ai/libreoffice-kit-win32-arm64',
+  '@deepseek-ai/libreoffice-kit-win32-x64',
+])
 
 /**
  * Whether a non-permissive runtime declaration has an identity-scoped owner
@@ -74,31 +94,34 @@ const OVERRIDES: Record<string, { license?: string; repo?: string }> = {
   '@modelcontextprotocol/server-filesystem': { license: 'MIT / Apache-2.0', repo: 'https://github.com/modelcontextprotocol/servers' },
   // No repository field in the published manifest.
   'node-addon-require-builtin': { repo: 'https://www.npmjs.com/package/node-addon-require-builtin' },
+  // No `license` field in the published manifest; the tarball's LICENSE.txt is the MIT text.
 }
 
 /**
- * Python dependencies are few and named directly in `pyproject.toml` files
- * without installed metadata to harvest, so license/repo are recorded here and
- * the generator fails when a manifest names a package this map misses.
+ * Python metadata is recorded from the distributions' license and project
+ * fields; generation does not require installing their wheels. Both Python
+ * manifests and the shared runtime lock reject names absent from this map.
  */
-const PYTHON_METADATA: Record<string, { license: string; repo: string; role: string }> = {
+const PYTHON_METADATA: Record<string, { license: string; repo: string; role?: string }> = {
   pydantic: { license: 'MIT', repo: 'https://github.com/pydantic/pydantic', role: 'runtime dependency of `deepseek-harness-sdk`' },
   hatchling: { license: 'MIT', repo: 'https://github.com/pypa/hatch', role: 'build backend' },
+  'et-xmlfile': { license: 'MIT', repo: 'https://foss.heptapod.net/openpyxl/et_xmlfile' },
+  lxml: { license: 'BSD-3-Clause', repo: 'https://github.com/lxml/lxml' },
+  numpy: { license: 'BSD-3-Clause', repo: 'https://github.com/numpy/numpy' },
+  openpyxl: { license: 'MIT', repo: 'https://foss.heptapod.net/openpyxl/openpyxl' },
+  pandas: { license: 'BSD-3-Clause', repo: 'https://github.com/pandas-dev/pandas' },
+  pillow: { license: 'MIT-CMU', repo: 'https://github.com/python-pillow/Pillow' },
+  'python-dateutil': { license: 'Apache-2.0 OR BSD-3-Clause', repo: 'https://github.com/dateutil/dateutil' },
+  'python-docx': { license: 'MIT', repo: 'https://github.com/python-openxml/python-docx' },
+  'python-pptx': { license: 'MIT', repo: 'https://github.com/scanny/python-pptx' },
   pytest: { license: 'MIT', repo: 'https://github.com/pytest-dev/pytest', role: 'test-only' },
+  six: { license: 'MIT', repo: 'https://github.com/benjaminp/six' },
+  'typing-extensions': { license: 'PSF-2.0', repo: 'https://github.com/python/typing_extensions' },
+  tzdata: { license: 'Apache-2.0', repo: 'https://github.com/python/tzdata' },
+  xlsxwriter: { license: 'BSD-2-Clause', repo: 'https://github.com/jmcnamara/XlsxWriter' },
 }
 
 type PythonMetadata = typeof PYTHON_METADATA
-
-/** Tools fetched by scripts at build time, keyed by the pin the script owns. */
-const BUILD_TIME_TOOLS = [
-  {
-    name: '@yao-pkg/pkg',
-    license: 'MIT',
-    repo: 'https://github.com/yao-pkg/pkg',
-    role: 'invoked by `scripts/build-exe-for-python-sdk.ts` to assemble the single-file SDK runtime executable',
-    pinSource: 'scripts/build-exe-for-python-sdk.ts',
-  },
-]
 
 /** The `package.json` fields this generator reads. */
 export interface Manifest {
@@ -117,7 +140,7 @@ interface ExternalDep {
   name: string
   license: string
   repo: string
-  /** True when some shipped workspace consumer reaches it through runtime dependency edges. */
+  /** True when a shipped workspace consumer installs it at runtime or embeds its implementation. */
   runtime: boolean
 }
 
@@ -304,7 +327,7 @@ function installedManifest(name: string, manifests: Map<string, Manifest>, expec
   let manifest: (Manifest & { license?: string; repository?: string | { url?: string }; homepage?: string }) | undefined
   // Workspace-local link farms can expose a dependency that is not linked at
   // the repository root; both are backed by the root workspace's lockfile.
-  for (const store of ['node_modules', 'native/landlock-run/node_modules']) {
+  for (const store of ['node_modules', 'native/system/node_modules']) {
     const direct = resolve(root, store, name, 'package.json')
     if (existsSync(direct)) {
       const candidate = JSON.parse(readFileSync(direct, 'utf8')) as typeof manifest
@@ -371,6 +394,7 @@ function normalizeRepo(raw: string | undefined): string | undefined {
   let url = raw
     .replace(/^git\+ssh:\/\/git@/, 'https://')
     .replace(/^git\+/, '')
+    .replace(/^git@([^:]+):/, 'https://$1/')
     .replace(/^git:\/\//, 'https://')
     .replace(/^github:/, 'https://github.com/')
     .replace(/\.git$/, '')
@@ -379,38 +403,48 @@ function normalizeRepo(raw: string | undefined): string | undefined {
 }
 
 /**
- * External npm dependencies, tiered by which workspace area declares them at
- * runtime: a package is runtime when any manifest outside `DEV_ONLY_AREAS`
- * names it in `dependencies`/`optionalDependencies`. A package declared only
- * by tooling, test infrastructure, the website, or the demo leaves — whatever
- * the declaring section is called — is development-only.
+ * Direct npm dependencies distributed through installed runtime libraries or
+ * embedded in Host and browser bundles. Tooling declarations alone do not imply distribution.
  */
-function collectNpmDeps(manifests: Map<string, Manifest>, names: Set<string>): ExternalDep[] {
-  return [...tierExternalDeps(manifests, names)]
+function collectNpmDeps(manifests: Map<string, Manifest>, names: Set<string>, browser: ReadonlySet<string>): ExternalDep[] {
+  return [...tierExternalDeps(manifests, names, browser)]
     .filter(([name]) => !FIRST_PARTY.has(name))
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([name, runtime]) => ({ name, ...installedMetadata(name, manifests), runtime }))
 }
 
 /**
- * Tier every external dependency the workspace declares.
+ * Tier every external dependency the workspace declares, including named Host embeddings.
  * @param manifests - workspace manifests keyed by repository-relative path.
  * @param names - every workspace package name, which never counts as external.
+ * @param browser - Direct third-party packages resolved by the browser builds.
  * @returns each external package mapped to whether it is a runtime dependency.
  */
-export function tierExternalDeps(manifests: Map<string, Manifest>, names: Set<string>): Map<string, boolean> {
+export function tierExternalDeps(
+  manifests: Map<string, Manifest>, names: Set<string>, browser: ReadonlySet<string> = new Set(),
+): Map<string, boolean> {
   const tiers = new Map<string, boolean>()
   // `tsx` is runtime by fiat: the root source-run scripts execute through its ESM hook.
   tiers.set('tsx', true)
   for (const [path, manifest] of manifests) {
     const devOnly = DEV_ONLY_AREAS.some(area => (area.endsWith('/') ? path.startsWith(area) : path === area))
+    const hostBundled = manifest.name === undefined ? [] : HOST_BUNDLED_DEPENDENCIES[manifest.name] ?? []
+    for (const dependency of hostBundled) {
+      if (!ALL_KINDS.some(kind => Object.hasOwn(manifest[kind] ?? {}, dependency))) {
+        throw new Error(`gen-third-party-notices: ${manifest.name} embeds ${dependency} but does not declare it`)
+      }
+    }
     for (const kind of ALL_KINDS) {
       for (const [dep, range] of Object.entries(manifest[kind] ?? {})) {
         if (names.has(dep) || range.startsWith('workspace:')) continue
-        const runtime = !devOnly && (RUNTIME_KINDS as readonly string[]).includes(kind)
+        const runtime = browser.has(dep) || hostBundled.includes(dep)
+          || !devOnly && (RUNTIME_KINDS as readonly string[]).includes(kind)
         tiers.set(dep, (tiers.get(dep) ?? false) || runtime)
       }
     }
+  }
+  for (const name of browser) {
+    if (!names.has(name) && !tiers.has(name)) throw new Error(`gen-third-party-notices: browser package ${name} has no workspace dependency declaration`)
   }
   return tiers
 }
@@ -447,7 +481,7 @@ export function parseVendoredRows(text: string): VendoredRow[] {
  * disclosed, so a row that stops matching the table format is a hard error
  * rather than a package that quietly vanishes from the notices.
  */
-function collectVendored(): VendoredRow[] {
+function collectVendored(): (VendoredRow & { sourceDirectory: string })[] {
   const rows = parseVendoredRows(readFileSync(resolve(root, 'vendor/README.md'), 'utf8'))
   const onDisk = new Map<string, string>()
   for (const entry of readdirSync(resolve(root, 'vendor'), { withFileTypes: true })) {
@@ -461,15 +495,15 @@ function collectVendored(): VendoredRow[] {
   if (missing.length > 0) {
     throw new Error(`gen-third-party-notices: vendor/README.md has no manifest-table row for ${missing.join(', ')}; its table format changed or the sync is incomplete.`)
   }
-  for (const row of rows) {
+  return rows.map((row) => {
     const dir = onDisk.get(row.npmName)
     if (dir === undefined) throw new Error(`gen-third-party-notices: vendored package ${row.npmName} from vendor/README.md has no vendor/ directory.`)
     const license = readManifest(`vendor/${dir}/package.json`).license
     if (license !== 'MIT') {
       throw new Error(`gen-third-party-notices: vendored ${row.npmName} declares license ${JSON.stringify(license)}; the vendored section assumes MIT throughout.`)
     }
-  }
-  return rows
+    return { ...row, sourceDirectory: `vendor/${dir}` }
+  })
 }
 
 /** Whether a parsed TOML value is a table rather than an array or scalar. */
@@ -585,7 +619,7 @@ export function collectPythonDependencies(
   return [...found].sort((a, b) => a.localeCompare(b)).map((name) => {
     const entry = metadata[name]
     if (entry === undefined) throw new Error(`gen-third-party-notices: python dependency ${name} is missing from PYTHON_METADATA.`)
-    return { name, ...entry }
+    return { name, ...entry, role: entry.role ?? 'Python project dependency' }
   })
 }
 
@@ -596,24 +630,41 @@ function collectPython(): { name: string; license: string; repo: string; role: s
   return collectPythonDependencies(manifests.map(path => readFileSync(resolve(root, path), 'utf8')))
 }
 
+/**
+ * Disclose every bundled wheel distribution using its locked version, rejecting duplicate normalized names.
+ * @param packages - Distribution names and exact versions from the shared runtime lock.
+ * @param metadata - License and source metadata for every locked distribution.
+ * @returns Normalized, sorted distribution identities with versions and licenses.
+ */
+export function collectBundledPythonDependencies(
+  packages: Readonly<Record<string, string>>,
+  metadata: PythonMetadata = PYTHON_METADATA,
+): { name: string; version: string; license: string; repo: string }[] {
+  const normalized = new Map<string, string>()
+  for (const [distribution, version] of Object.entries(packages)) {
+    const name = normalizePythonDistributionName(distribution)
+    const previous = normalized.get(name)
+    if (previous !== undefined && previous !== version) {
+      throw new Error(`gen-third-party-notices: bundled Python distribution ${name} has conflicting locked versions.`)
+    }
+    if (previous !== undefined) throw new Error(`gen-third-party-notices: bundled Python distribution ${name} has duplicate normalized names.`)
+    normalized.set(name, version)
+  }
+  return [...normalized].sort(([a], [b]) => a.localeCompare(b)).map(([name, version]) => {
+    const entry = metadata[name]
+    if (entry === undefined) throw new Error(`gen-third-party-notices: bundled Python distribution ${name} is missing from PYTHON_METADATA.`)
+    return { name, version, license: entry.license, repo: entry.repo }
+  })
+}
+
 /** pnpm-patched external packages, from `pnpm-workspace.yaml`. */
 function collectPatched(): { spec: string; patch: string }[] {
   const workspace = yaml.load(readFileSync(resolve(root, 'pnpm-workspace.yaml'), 'utf8')) as { patchedDependencies?: Record<string, string> }
   return Object.entries(workspace.patchedDependencies ?? {}).map(([spec, patch]) => ({ spec, patch }))
 }
 
-/** Verify each build-time tool pin still appears in its owning script. */
-function verifyBuildTimePins(): void {
-  for (const tool of BUILD_TIME_TOOLS) {
-    const text = readFileSync(resolve(root, tool.pinSource), 'utf8')
-    if (!text.includes(tool.name)) {
-      throw new Error(`gen-third-party-notices: ${tool.pinSource} no longer references ${tool.name}; update BUILD_TIME_TOOLS.`)
-    }
-  }
-}
-
 /** SPDX identifiers this project may ship without further review. */
-const PERMISSIVE_LICENSES = new Set(['MIT', 'ISC', 'BSD-2-Clause', 'BSD-3-Clause', 'Apache-2.0', '0BSD', 'Unlicense', 'CC0-1.0', 'BlueOak-1.0.0', 'Python-2.0'])
+const PERMISSIVE_LICENSES = new Set(['MIT', 'MIT-CMU', 'ISC', 'BSD-2-Clause', 'BSD-3-Clause', 'Apache-2.0', '0BSD', 'Unlicense', 'CC0-1.0', 'BlueOak-1.0.0', 'Python-2.0', 'PSF-2.0'])
 
 /** Evaluate a parsed SPDX expression under the repository's license policy. */
 function isPermissiveSpdx(expression: ReturnType<typeof parseSpdx>): boolean {
@@ -644,6 +695,20 @@ export function isPermissive(license: string): boolean {
     return isPermissiveSpdx(parseSpdx(normalized))
   } catch {
     return false
+  }
+}
+
+/**
+ * Reject unapproved non-permissive licenses on installed or browser-bundled code.
+ * @param dependencies - Disclosed runtime package identities and declared licenses.
+ * @throws When a runtime package has no permissive license or exact owner authorization.
+ */
+export function assertRuntimeLicenses(dependencies: readonly { name: string; license: string }[]): void {
+  const rejected = dependencies.filter(dep => !isPermissive(dep.license)
+    && !isOwnerAuthorizedRuntime(dep.name)
+    && !(LIBREOFFICE_PACKAGES.has(dep.name) && dep.license === 'MPL-2.0'))
+  if (rejected.length > 0) {
+    throw new Error(`gen-third-party-notices: runtime ${rejected.map(dep => `${dep.name} (${dep.license})`).join(', ')} is not a permissive license; review the distribution terms and record the decision before regenerating.`)
   }
 }
 
@@ -689,19 +754,23 @@ ${rows.join('\n')}
 
 /**
  * Render the complete notices document.
- * @returns the exact bytes `THIRD_PARTY_NOTICES.md` must hold.
+ * @returns The exact bytes THIRD_PARTY_NOTICES.md must hold after resolving browser inputs.
  */
-export function render(): string {
-  verifyBuildTimePins()
+export async function render(): Promise<string> {
+  const browser = await browserBundledExternals(root)
+  // The Inspector's Host build hook compiles this standalone frontend outside the Client bundle graph.
+  browser.add('chrome-devtools-frontend')
   // The linked-manifest cache is keyed by name only, so it must not outlive
   // the manifests map it was resolved from; render() owns that single load.
   workspaceLinkedManifestCache.clear()
   const { manifests, names } = loadWorkspaceManifests()
-  const npm = collectNpmDeps(manifests, names)
+  const npm = collectNpmDeps(manifests, names, browser)
   const runtimeDeps = npm.filter(dep => dep.runtime)
   const devDeps = npm.filter(dep => !dep.runtime)
+  const kitRuntime = runtimeDeps.some(dep => dep.name === LIBREOFFICE_KIT_PACKAGE)
   const vendored = collectVendored()
   const python = collectPython()
+  const bundledPython = collectBundledPythonDependencies(primaryRuntimeLock.pythonPackages)
   const patched = collectPatched()
   const claudeDistribution = runtimeDeps.some(
     dep => dep.name === CLAUDE_AGENT_SDK_PACKAGE,
@@ -709,15 +778,8 @@ export function render(): string {
     ? collectClaudeDistribution(manifests)
     : undefined
   const nonPermissiveDev = devDeps.filter(dep => !isPermissive(dep.license))
-  // A copyleft license reaching a shipped surface is a distribution decision,
-  // not a rendering detail; the notices cannot quietly absorb it.
-  const nonPermissiveRuntime = runtimeDeps.filter(dep =>
-    !isPermissive(dep.license)
-    && !isOwnerAuthorizedRuntime(dep.name),
-  )
-  if (nonPermissiveRuntime.length > 0) {
-    throw new Error(`gen-third-party-notices: runtime ${nonPermissiveRuntime.map(dep => `${dep.name} (${dep.license})`).join(', ')} is not a permissive license; review the distribution terms and record the decision before regenerating.`)
-  }
+  assertRuntimeLicenses(runtimeDeps)
+  assertRuntimeLicenses(bundledPython)
   const patchedLines = patched.map(({ spec, patch }) => `- \`${spec}\` — [\`${patch}\`](${patch})`)
 
   return `<!-- Generated by scripts/gen-third-party-notices.ts — do not edit by hand.
@@ -727,32 +789,44 @@ export function render(): string {
 
 DeepSeek Harness is licensed under [MIT](LICENSE). It depends on the third-party software listed below. Each project remains under its own license; nothing in this file changes those terms.
 
-This file lists **direct** dependencies declared by the workspace and the explicitly disclosed official Claude Code platform payload closure. It is generated from the workspace manifests by \`scripts/gen-third-party-notices.ts\`: a pre-commit hook regenerates it whenever a staged file changes one of its inputs, and \`scripts/gen-third-party-notices.spec.ts\` asserts in the test lane that the committed bytes match. Deleting a manifest runs no hook, so that case is caught by the assertion instead. Run \`pnpm run verify-third-party-notices\` for the standalone check.
+This file lists **direct** dependencies declared by the workspace, the explicitly disclosed official Claude Code platform payload closure, and the Bundled Python distributions. It is generated by \`scripts/gen-third-party-notices.ts\`, and \`scripts/gen-third-party-notices.spec.ts\` asserts in the test lane that the committed bytes match. Run \`pnpm run gen-third-party-notices\` after changing one of its inputs, or \`pnpm run verify-third-party-notices\` for the standalone check.
 
-The complete npm transitive closure, including the Landlock launcher workspace, is recorded with exact pinned versions in [\`pnpm-lock.yaml\`](pnpm-lock.yaml) — inspect it with \`pnpm licenses list\`. The Python closure is recorded separately in [\`python/sdk/uv.lock\`](python/sdk/uv.lock).
+The complete npm transitive closure, including the Landlock launcher workspace, is recorded with exact pinned versions in [\`pnpm-lock.yaml\`](pnpm-lock.yaml) — inspect it with \`pnpm licenses list\`. The Python SDK closure is recorded separately in [\`python/sdk/uv.lock\`](python/sdk/uv.lock).
 
 ## Vendored source (\`vendor/\`)
 
 The Cordis framework and its foundation libraries are source-vendored into this repository rather than consumed from npm, and republished under the \`@deepseek-ai\` scope. All are MIT-licensed; each directory preserves its upstream \`LICENSE\` file. Exact upstream commits and local modifications are recorded in [\`vendor/README.md\`](vendor/README.md).
 
-| Package | Upstream name | Upstream | License |
+| Package | Upstream name | Source | License |
 | --- | --- | --- | --- |
-${vendored.map(row => `| \`${row.npmName}\` | \`${row.upstreamName}\` | [${row.upstream.replace('https://', '')}](${row.upstream}) | MIT |`).join('\n')}
+${vendored.map(row => `| \`${row.npmName}\` | \`${row.upstreamName}\` | [${row.sourceDirectory}](${row.sourceDirectory}/) | MIT |`).join('\n')}
 
 ## Runtime npm dependencies
 
-External packages that a workspace package resolves at runtime. The tier covers every plugin a user can mount from \`cordis.yml\` — not only what the \`dsh\` CLI, Web UI, and Python SDK runtime load by default.
+External packages installed for runtime use or embedded in distributed Host or browser artifacts. Browser inputs are resolved through the shipping tsdown and Vite configurations, independently of npm dependency sections. Host embedding declarations identify the distributing package and its embedded dependencies. The tier covers every plugin a user can mount from \`cordis.yml\` — not only what the \`dsh\` CLI, Web UI, and Python SDK runtime load by default.
 
 ${renderNpmTable(runtimeDeps)}
 
 pnpm applies local patches to the following packages at install time, so shipped artifacts carry modified copies; each patch file is the complete record of the modification:
 
 ${patchedLines.join('\n')}
+
+## Chrome DevTools frontend
+
+The optional experimental Inspector distributes a locally compiled copy of [chrome-devtools-frontend ${DEVTOOLS_NPM_VERSION}](https://www.npmjs.com/package/chrome-devtools-frontend/v/${DEVTOOLS_NPM_VERSION}), from upstream revision [${DEVTOOLS_SOURCE_REVISION}](https://chromium.googlesource.com/devtools/devtools-frontend/+/${DEVTOOLS_SOURCE_REVISION}). The build includes the Chromium [BSD-3-Clause license](packages/experimental/inspector/assets/devtools/LICENSE) and the third-party license and notice files supplied by the npm source. The Chromium root license does not replace those dependencies' licenses.
+
 ${renderClaudeDistribution(claudeDistribution)}
+${kitRuntime ? `
+## LibreOffice conversion kit
+
+${[...LIBREOFFICE_PACKAGES].map(name => `\`${name}\``).join(', ')} declare MPL-2.0, which remains outside the permissive-license allowlist; the notices check accepts only these package identities at those terms. The [distribution decision](.agents/notes/implemented/architecture/2026-09-14-independent-libreoffice-kit.md) records the source obligations.
+
+The [kit repository](https://github.com/deepseek-ai/dsh-libreoffice-kit) supplies the corresponding LibreOffice source pin, modifications, build instructions, Node API, and artifact validation. Its engine packages retain their license and third-party notices; the Node API retains its MPL-2.0 declaration and NOTICE. Recipients must have access to those corresponding sources and notices.
+` : ''}
 
 ## Development-only npm dependencies
 
-External packages **directly declared** only by repository tooling, test infrastructure, the documentation site, the demo leaves, or the native launcher's build workspace. No shipped surface names them itself. A package here may still be pulled in transitively by a runtime dependency — \`pnpm-lock.yaml\` is the authority on the full closure — so this tier records who declares a package, not what a build ultimately bundles.
+External packages **directly declared** for development, tests, types, or tooling, without a runtime installation or distribution inside a Host or browser bundle. A package here may still be pulled in transitively by a runtime dependency — \`pnpm-lock.yaml\` is the authority on that full closure.
 
 ${renderNpmTable(devDeps)}
 ${renderNonPermissiveNote(nonPermissiveDev)}
@@ -765,23 +839,25 @@ Direct dependencies of the \`pyproject.toml\` manifests, plus \`uv\` as the deve
 ${python.map(dep => `| [\`${dep.name}\`](${dep.repo}) | ${dep.license} | ${dep.role} |`).join('\n')}
 | [\`uv\`](https://github.com/astral-sh/uv) | MIT / Apache-2.0 | development workflow tool |
 
-## Fetched at build time
+## Bundled Python distributions
 
-| Package | License | Role |
+The [shared runtime lock](scripts/primary-runtime/lock.json) records each distribution version and the wheel download hashes. The table includes every entry in \`pythonPackages\`, including transitive dependencies. Wheel extraction preserves distribution metadata and the license and notice files supplied by each archive. Project licenses below do not enumerate the separate licenses of native libraries bundled inside wheels.
+
+| Distribution | Locked version | Project license |
 | --- | --- | --- |
-${BUILD_TIME_TOOLS.map(tool => `| [\`${tool.name}\`](${tool.repo}) | ${tool.license} | ${tool.role} |`).join('\n')}
+${bundledPython.map(dep => `| [\`${dep.name}\`](${dep.repo}) | ${dep.version} | ${dep.license} |`).join('\n')}
 
 ## First-party native packages
 
-\`@deepseek-ai/node-addon-landlock-run\` (and its platform packages) is built and released from this repository under BSD 3-Clause. It is listed here for completeness; it is first-party, not third-party.
+\`@deepseek-ai/node-addon-system\` (and its platform packages) is built and released from this repository under BSD 3-Clause. It is listed here for completeness; it is first-party, not third-party.
 `
 }
 
 /** CLI entry: default writes the notices, `--check` fails if the committed copy
  * is stale. Guarded behind an entry-point check so importing this module for
  * tests neither regenerates the committed file nor calls process.exit. */
-function main(): void {
-  const content = render()
+async function main(): Promise<void> {
+  const content = await render()
   if (process.argv.includes('--check')) {
     let committed: string | null = null
     try {
@@ -804,5 +880,5 @@ function main(): void {
 }
 
 if (process.argv[1] !== undefined && import.meta.filename === resolve(process.argv[1])) {
-  main()
+  await main()
 }

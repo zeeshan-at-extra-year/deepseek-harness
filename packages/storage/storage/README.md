@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-Mount `dsh-storage` to give a composition durable, non-session storage: it is the hub where backends and data forms connect, so host packages can read and write typed records through `ctx.storageDomain`. The hub performs no IO itself — backends own the medium (a file-tree root, a database file), and data forms own semantics — so a composition pairs it with one or more backends and the domain form. It is optional and host-side only: it registers no tools, injects no prompts, and writes no session events, so the model and the agent loop never see it. Choose it whenever any package in the composition needs durable data that is not a session event log; a composition with no such data can omit the whole group.
+Use `dsh-storage` to keep typed application data durable without adding it to session history. Mount it with a supported storage medium and domain configuration, then callers can access records through the public `ctx.storageDomain` API. Choose it for workspace records, session sidecars, or other application state that must survive restarts without becoming session events. It is available only to host code and has no model-visible effect; compositions that do not need such data can omit it.
 
 ## Table of Contents
 
@@ -76,7 +76,7 @@ The hub is a pure registration table with two faces, designed so backends and da
 
 ### The backend contract
 
-[`src/backend.ts`](src/backend.ts) is the normative contract for backend implementers, checked clause by clause by the shared conformance suite in `tests/contract.ts`. A backend owns exactly one medium and exposes optional data-shape facets; `kv` is the only facet, and opening a unit yields a versioned, globally-singleton schema handle whose single calls are atomic and durable once resolved. Unit and table names must match `UNIT_NAME_RE`; record keys are arbitrary strings that never reach file paths. The unit does not serialize concurrent writes — ordering belongs to the caller — and a stored version differing from the descriptor rejects `version-mismatch` (no migration).
+[`src/backend.ts`](src/backend.ts) is the normative contract for backend implementers; the shared conformance suite in `tests/contract.ts` checks whole-unit behavior on both shipped backends. A backend owns exactly one medium and exposes optional data-shape facets; `kv` is the only facet. Opening a unit yields a handle for opaque JSON values whose atomicity and durability follow the selected layout. Unit and table names must match `UNIT_NAME_RE`. Whole-unit keys stay opaque; JSON per-record keys become path-safe file segments. The caller orders concurrent writes. Reads accept the current or declared `compatibleVersions`; unsupported unit stamps reject `version-mismatch`, while unsupported JSON per-record documents read as absent. Mutations atomically stamp the current version with their data; a missing-key delete does not restamp. Domains own value conversion, and backend implementers must preserve these semantics; see [domain versioning](../../../docs/subsystems/storage.md#domain-versioning) for mixed values, failure recovery, and upgrades.
 
 ### Source map
 
@@ -86,7 +86,6 @@ The hub is a pure registration table with two faces, designed so backends and da
 | [`src/registry.ts`](src/registry.ts) | `BackendRegistry`: name → backend table, registration disposers |
 | [`src/backend.ts`](src/backend.ts) | The backend contract: facets, units, `UNIT_NAME_RE` |
 | [`src/error.ts`](src/error.ts) | `StorageError` codes shared by the hub and every backend |
-| — | No runtime invariant companion is published; the hub is a pure registration table (names → backends, forms → facilities) whose consistency is fully enforced at the call sites (duplicate/missing entries fail loud synchronously); it owns no event stream or mutable medium to cross-check. |
 | [`tests/contract.ts`](tests/contract.ts) | The shared conformance suite run against each backend |
 
 </details>

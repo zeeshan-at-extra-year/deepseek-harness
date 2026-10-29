@@ -9,25 +9,28 @@
 import { Context, Service } from '@deepseek-ai/cordis'
 import { isAbsolute } from 'node:path'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import { deepFreeze, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
+import { assertNever, deepFreeze, snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import { scopeOf, scopeTarget } from '@deepseek-ai/dsh-scope'
 import type { Scoped } from '@deepseek-ai/dsh-scope'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import { SESSION_FORMAT_VERSION, SessionLogOffset, SessionSeq } from './types.ts'
 import type { TypertLookup } from '@deepseek-ai/dsh-typert-protocol'
-import type { CreateSessionOptions, EpochHeader, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventType, SessionHeader, SessionId, SurfaceIntent, SurfaceEventType } from './types.ts'
-import { deriveEventMessage, SurfaceManager } from './surface.ts'
-import type { SessionSurface } from './surface.ts'
+import type { CreateSessionOptions, EpochHeader, PluginRecord, PluginRecordMap, PluginRecordType, PrepareSessionOptions, RequestContext, SessionEvent, SessionEventMap, SessionEventType, SessionHeader, SessionId, SessionSeedEventState, SurfaceIntent, SurfaceEventType } from './types.ts'
+import { SurfaceManager, validateSessionEventData, validateSurfaceMetadata } from './surface.ts'
+import type { SessionSurface, SessionMessageProjection } from './surface.ts'
 import { foldRequestHeader } from './request-header.ts'
+import { ToolHistoryProjection } from './tool-history.ts'
+import type { ToolHistory } from '@deepseek-ai/dsh-llm'
 
+import { buildForkSeed } from './fork.ts'
+
+export { buildForkSeed } from './fork.ts'
 export * from './types.ts'
 export { SessionPreparation } from './preparation.ts'
 export type { SessionPreparationOptions } from './preparation.ts'
-export type { AssistantMessage, ToolResultMessage, UserMessage } from '@deepseek-ai/dsh-llm'
-export { interruptedTurnClosers, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from './repair.ts'
-export { decodeStorageRecord, packChunkRuns } from './chunk-rows.ts'
-export type { ChunkRow, StorageRecord } from './chunk-rows.ts'
-export type { SessionSurface, SurfaceFoldReplacement, SurfaceFoldResult } from './surface.ts'
+export type { AssistantMessage, DeveloperMessage, SystemMessage, ToolResultMessage, UserMessage } from '@deepseek-ai/dsh-llm'
+export { interruptedTurnClosers, ToolCallRecovery, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from './repair.ts'
+export type { SessionSurface, SurfaceFoldReplacement, SurfaceFoldResult, SessionMessageProjection, SessionMessageProjectionContext } from './surface.ts'
 export { deriveEventMessage, foldSurface, isAppendSurfaceEvent, isReplacementSurfaceEvent, isSurfaceEvent, isSurfaceEligibleType } from './surface.ts'
 export { canonicalHeader, foldRequestHeader, headerEquals } from './request-header.ts'
 export { KNOWN_SESSION_EVENT_TYPES } from './known-event-types.ts'
@@ -39,14 +42,15 @@ declare module '@deepseek-ai/cordis' {
 
   interface Events {
     /**
-     * Creation announcement during session publication. A synchronous throw vetoes and rolls
-     * back with a paired disposal; detach requested during dispatch is deferred.
+     * Read-only creation announcement after store entry.
+     * New events reject until every synchronous listener has returned successfully.
+     * A synchronous throw vetoes creation and rolls back with a paired disposal;
+     * detach requested during dispatch is deferred.
      * A returned-promise rejection is logged but cannot retroactively veto this
      * synchronous boundary.
      * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): agent-scoped listeners
      * receive only sessions entered through that agent's context.
      * @param session - the session just entered and announced.
-     * @dshScopeScan unsupported
      * @mode emit
      */
     'session/created'(this: Scoped<Session>, session: Session): void
@@ -56,7 +60,6 @@ declare module '@deepseek-ai/cordis' {
      * did not begin. Listener failures are logged and contained.
      * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`) reuses the owner scope.
      * @param session - the session that is no longer live in the store.
-     * @dshScopeScan unsupported
      * @mode emit
      */
     'session/disposed'(this: Scoped<Session>, session: Session): void
@@ -68,7 +71,6 @@ declare module '@deepseek-ai/cordis' {
      * receive only events from sessions entered through that agent's context.
      * @param session - the session whose log grew.
      * @param event - the appended event, exactly as recorded.
-     * @dshScopeScan unsupported
      * @mode emit
      */
     'session/event'(this: Scoped<Session>, session: Session, event: SessionEvent): void
@@ -77,7 +79,6 @@ declare module '@deepseek-ai/cordis' {
      * caller awaits all of them, with no waterfall veto. Scope-filtered dispatch
      * (`@deepseek-ai/dsh-scope`) reuses the session's owner scope.
      * @param session - the session whose buffered events must reach durable storage.
-     * @dshScopeScan unsupported
      * @mode parallel
      */
     'session/flush'(this: Scoped<Session>, session: Session): Promise<void> | void
@@ -163,8 +164,11 @@ function snapshotSessionHeader(id: SessionId, source?: SessionHeader): SessionHe
  * Use {@link snapshotSessionEvent} when exclusive ownership is not guaranteed.
  * @param event - exclusively owned event imported across a trusted boundary.
  * @returns the same event object with a validated, deeply frozen message.
+ * @throws when event-local surface metadata, request-header fields, or message invariants are invalid; history relations are not checked.
  */
 export function adoptSessionEvent<T extends SessionEvent>(event: T): T {
+  validateSessionEventData(event, `session event at seq ${event.seq}`)
+  validateSurfaceMetadata(event)
   assertMessageEventShape(
     event,
     `session event at seq ${event.seq}`,
@@ -173,6 +177,8 @@ export function adoptSessionEvent<T extends SessionEvent>(event: T): T {
     case 'user/message':
       deepFreeze(event.data)
       break
+    case 'developer/message':
+    case 'system/message':
     case 'assistant/message':
     case 'tool/result':
       deepFreeze(event.data.message)
@@ -193,28 +199,12 @@ export function snapshotSessionEvent<T extends SessionEvent>(event: T): T {
   return adoptSessionEvent(structuredClone(event))
 }
 
-/** Deep-freeze one acyclic JSON tree without consuming the JavaScript call stack. */
-function freezeRestoredObject<T extends object>(value: T): T {
-  const pending: object[] = [value]
-  while (pending.length > 0) {
-    // The non-empty check proves an object remains to visit.
-    // oxlint-disable-next-line typescript/no-non-null-assertion
-    const current = pending.pop()!
-    Object.freeze(current)
-    for (const key in current) {
-      const child = (current as Record<string, unknown>)[key]
-      if (child !== null && typeof child === 'object') pending.push(child)
-    }
-  }
-  return value
-}
-
 /** Validate the fixed event envelope after one-pass JSON materialization. */
-function assertSessionEventEnvelope(value: Record<string, unknown>, index: number): asserts value is SessionEvent {
-  const event = value
-  if (event['type'] === 'request/header-delta') {
-    throw new Error(`seed event at index ${index} uses unsupported legacy request/header-delta format`)
+function assertSessionEventEnvelope(value: unknown, index: number): asserts value is SessionEvent {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`seed event at index ${index} has an invalid event envelope`)
   }
+  const event = value as Record<string, unknown>
   for (const key in event) {
     switch (key) {
       case 'type':
@@ -239,9 +229,13 @@ function assertSessionEventEnvelope(value: Record<string, unknown>, index: numbe
     || (event['ignorable'] !== undefined && event['ignorable'] !== true)) {
     throw new Error(`seed event at index ${index} has an invalid event envelope`)
   }
+  validateSessionEventData(event as SessionEvent, `seed ${type} at index ${index}`)
   switch (type) {
     case 'request/header':
+    case 'developer/message':
+    case 'system/message':
     case 'user/message':
+    case 'assistant/attempt':
     case 'assistant/message':
     case 'tool/result':
       assertCurrentLlmShape(event, index)
@@ -256,11 +250,8 @@ function assertCurrentLlmShape(event: Record<string, unknown>, index: number): v
     ? data as Record<string, unknown>
     : undefined
   if (event['type'] === 'request/header') {
-    const header = record?.['header']
-    const headerRecord = typeof header === 'object' && header !== null && !Array.isArray(header)
-      ? header as Record<string, unknown>
-      : undefined
-    const config = headerRecord?.['config']
+    const headerRecord = record?.['header'] as Record<string, unknown>
+    const config = headerRecord['config']
     if (!hasProviderModel(config)) throw new Error(`seed request/header at index ${index} lacks provider/model`)
     const configRecord = config as Record<string, unknown>
     const reasoningEffort = configRecord['reasoningEffort']
@@ -268,12 +259,40 @@ function assertCurrentLlmShape(event: Record<string, unknown>, index: number): v
       && (typeof reasoningEffort !== 'string' || reasoningEffort.length === 0)) {
       throw new Error(`seed request/header at index ${index} has an invalid reasoningEffort`)
     }
-    assertAdapterDefaults(headerRecord?.['adapterDefaults'], configRecord, index)
+    assertAdapterDefaults(headerRecord['adapterDefaults'], configRecord, index)
+    const reason = record?.['reason']
+    if (reason !== 'initial' && reason !== 'resume' && reason !== 'change' && reason !== 'series') {
+      throw new Error(`seed request/header at index ${index} has an invalid reason`)
+    }
+    if (record?.['startsSeries'] !== undefined && record['startsSeries'] !== true) {
+      throw new Error(`seed request/header at index ${index} has an invalid startsSeries marker`)
+    }
   }
   const type = event['type']
-  if (type !== 'user/message' && type !== 'assistant/message'
-    && type !== 'tool/result') return
+  if (type === 'assistant/attempt') {
+    assertAssistantSettlementShape(record, type, index)
+    return
+  }
+  if (!isMessageEventType(type)) return
   assertMessageEventShape(event, `seed ${type} at index ${index}`)
+  if (type === 'assistant/message') {
+    assertAssistantSettlementShape(record, type, index)
+  }
+}
+
+/** Validate fields used directly by restored Session lifecycle logic without replaying the embedded stream. */
+function assertAssistantSettlementShape(
+  data: Record<string, unknown> | undefined,
+  type: 'assistant/attempt' | 'assistant/message',
+  index: number,
+): void {
+  const turn = data?.['turn']
+  const step = data?.['step']
+  if (typeof turn !== 'number' || !Number.isSafeInteger(turn) || turn < 0 || Object.is(turn, -0)
+    || typeof step !== 'number' || !Number.isSafeInteger(step) || step < 0 || Object.is(step, -0)
+    || !Array.isArray(data?.['stream'])) {
+    throw new Error(`seed ${type} at index ${index} has invalid settlement fields`)
+  }
 }
 
 const allowedAdapterKeys = new Set(['reasoningEffort', 'maxTokens'])
@@ -297,11 +316,24 @@ function assertAdapterDefaults(
   }
 }
 
+/** The surface event types whose payload carries an identified message. */
+function isMessageEventType(type: unknown): type is SurfaceEventType {
+  return type === 'developer/message' || type === 'system/message' || type === 'user/message'
+    || type === 'assistant/message' || type === 'tool/result'
+}
+
+const MESSAGE_ROLE_BY_TYPE: Record<SurfaceEventType, Message['role']> = {
+  'system/message': 'system',
+  'developer/message': 'developer',
+  'user/message': 'user',
+  'assistant/message': 'assistant',
+  'tool/result': 'tool',
+}
+
 /** Validate only the event-specific invariants needed to safely replay a message. */
 function assertMessageEventShape(event: Record<string, unknown>, subject: string): void {
   const type = event['type']
-  if (type !== 'user/message' && type !== 'assistant/message'
-    && type !== 'tool/result') return
+  if (!isMessageEventType(type)) return
   const data = event['data']
   const record = typeof data === 'object' && data !== null
     ? data as Record<string, unknown>
@@ -313,7 +345,7 @@ function assertMessageEventShape(event: Record<string, unknown>, subject: string
     throw new Error(`${subject} lacks an identified message`)
   }
   const messageRecord = message as Record<string, unknown>
-  const expectedRole = type === 'assistant/message' ? 'assistant' : 'user'
+  const expectedRole = MESSAGE_ROLE_BY_TYPE[type]
   if (messageRecord['role'] !== expectedRole) {
     throw new Error(`${subject} message must have role "${expectedRole}"`)
   }
@@ -327,6 +359,12 @@ function assertMessageEventShape(event: Record<string, unknown>, subject: string
     throw new Error(`${subject} message has invalid content`)
   }
   const sourceRecord = source as Record<string, unknown>
+  if (type === 'system/message') {
+    if (sourceRecord['kind'] !== 'system-prompt') {
+      throw new Error(`${subject} message must have system-prompt source`)
+    }
+    return
+  }
   if (type === 'assistant/message') {
     if (sourceRecord['kind'] !== 'model' || !hasProviderModel(sourceRecord)) {
       throw new Error(`${subject} message must have model source`)
@@ -339,14 +377,7 @@ function assertMessageEventShape(event: Record<string, unknown>, subject: string
     || sourceRecord['callId'] === '') {
     throw new Error(`${subject} message must have tool source`)
   }
-  const content = messageRecord['content'] as unknown[]
-  const block = content[0]
-  if (content.length !== 1 || typeof block !== 'object' || block === null
-    || (block as Record<string, unknown>)['type'] !== 'tool-result'
-    || !Array.isArray((block as Record<string, unknown>)['content'])) {
-    throw new Error(`${subject} message must contain one tool-result block`)
-  }
-  if ((block as Record<string, unknown>)['toolCallId'] !== sourceRecord['callId']) {
+  if (messageRecord['toolCallId'] !== sourceRecord['callId']) {
     throw new Error(`${subject} message has mismatched tool call ids`)
   }
 }
@@ -357,18 +388,6 @@ function hasProviderModel(value: unknown): boolean {
   const pair = value as Record<string, unknown>
   return typeof pair['provider'] === 'string' && pair['provider'].length > 0
     && typeof pair['model'] === 'string' && pair['model'].length > 0
-}
-
-/** Reject request-header vocabulary removed with the legacy delta codec. */
-function assertSupportedRequestHeader(type: string, data: unknown, location: string): void {
-  if (type === 'request/header-delta') {
-    throw new Error(`${location} uses unsupported legacy request/header-delta format`)
-  }
-  if (type === 'request/header'
-    && data !== null && typeof data === 'object' && !Array.isArray(data)
-    && (data as Record<string, unknown>)['reason'] === 'fallback') {
-    throw new Error(`${location} uses unsupported legacy request/header reason "fallback"`)
-  }
 }
 
 type SessionCallback = (...args: unknown[]) => unknown
@@ -404,15 +423,96 @@ interface SessionEntry {
   readonly session: Session
   readonly carrier: Scoped<Session>
   readonly emitCtx: Context
-  announced: boolean
-  announcing: boolean
+  announcement: 'pending' | 'dispatching' | 'complete' | 'failed'
   appending: boolean
   detachRequested: boolean
   detach(): void
 }
 
-/** Store attachment for the append path; module-private to keep Session store-agnostic publicly. */
-const attachments = new WeakMap<Session, SessionEntry>()
+/** Store-owned Sessions retain a null entry while unentered; absent keys are independent. */
+const attachments = new WeakMap<Session, SessionEntry | null>()
+
+/**
+ * Grammar of a {@link PluginRecordType}: `plugin:` followed by
+ * slash-separated segments of lowercase letters, digits, `.`, `_`, and `-`,
+ * each segment starting with a letter or digit.
+ */
+const PLUGIN_RECORD_TYPE = /^plugin:[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/u
+
+/**
+ * Whether one event type name follows the plugin record grammar.
+ * @param type - an event type name.
+ * @returns whether the name is a {@link PluginRecordType}.
+ */
+function isPluginRecordType(type: string): type is PluginRecordType {
+  return PLUGIN_RECORD_TYPE.test(type)
+}
+
+/**
+ * Type one constructed plugin record as a log event after checking its type
+ * against the plugin record grammar. A restored Session already holds events
+ * whose types are outside `SessionEventMap` when they are marked ignorable;
+ * a plugin record is such an event.
+ * @param value - the frozen record envelope built by {@link Session}.
+ * @throws when the record type is outside the plugin record grammar.
+ */
+function assertPluginRecordEvent(value: unknown): asserts value is SessionEvent {
+  const { type } = value as { readonly type: string }
+  if (!isPluginRecordType(type)) {
+    throw new Error(`plugin record type "${type}" must be "plugin:" followed by lowercase slash-separated segments`)
+  }
+}
+
+/** Module-private access to {@link Session}'s record commit, assigned once by its static block. */
+let commitPluginRecord: (session: Session, type: PluginRecordType, data: unknown) => SessionSeq
+
+/**
+ * Append one experimental plugin record: an event marked `ignorable` whose
+ * type is declared in {@link PluginRecordMap}, outside {@link SessionEventMap}.
+ * The plugin record catalog lists it separately from released event schemas.
+ * A reader that does not recognize the type retains and skips the record, which never
+ * enters the model-visible surface, and fork and resume carry it with the rest
+ * of the log. A Session format migration retains records on a best-effort
+ * basis, so a record holds plugin-owned state that its owner can lose without
+ * changing how the rest of the log is interpreted.
+ *
+ * Only production source under `packages/experimental/` may call this
+ * function; the `verify-plugin-record-callers` gate rejects any other
+ * production caller in this repository. Read records back with
+ * {@link pluginRecordOf}.
+ * @param session - the Session whose log receives the record.
+ * @param type - declared record name: `plugin:` followed by slash-separated
+ *   segments of lowercase letters, digits, `.`, `_`, and `-`, each starting
+ *   with a letter or digit.
+ * @param data - JSON payload, snapshotted before it enters the log.
+ * @returns the sequence number of the committed record.
+ * @throws when a store-owned Session is unentered or its creation announcement
+ *   has not completed, when `type` is outside
+ *   that grammar, when `data` is not losslessly
+ *   JSON-serializable, or when the call reenters another append's publication;
+ *   a rejected record does not change the log.
+ */
+export function appendPluginRecord<K extends Extract<keyof PluginRecordMap, PluginRecordType>>(
+  session: Session,
+  type: K,
+  data: NoInfer<PluginRecordMap[K]>,
+): SessionSeq {
+  return commitPluginRecord(session, type, data)
+}
+
+/**
+ * Read one committed event as a plugin record. The V3-to-V4 format edge also
+ * renames each unknown ignorable V3 event into the `plugin:` namespace, so an
+ * owner names its records under its own package name and validates `data`.
+ * @param event - any committed Session event, live or restored.
+ * @returns the record, or undefined when the event is not an ignorable event
+ *   whose type follows the plugin record grammar.
+ */
+export function pluginRecordOf(event: SessionEvent): PluginRecord | undefined {
+  const type: string = event.type
+  if (event.ignorable !== true || !isPluginRecordType(type)) return undefined
+  return { type, seq: event.seq, time: event.time, data: event.data }
+}
 
 /**
  * An event-sourced session: an append-only log of {@link SessionEvent}s.
@@ -425,7 +525,7 @@ const attachments = new WeakMap<Session, SessionEntry>()
 export class Session {
   private log: SessionEvent[] = []
   /** Single incremental owner of surface acceptance and projection state. */
-  private readonly surfaceManager = new SurfaceManager(this.log)
+  private readonly surfaceManager: SurfaceManager
 
   /** The ordered surface over this session's event log. */
   get surface(): SessionSurface {
@@ -451,28 +551,26 @@ export class Session {
   }
 
   /**
-   * The first seq appended IN THIS PROCESS: the length of the constructor
-   * seed (0 without one). Events with smaller seq values entered through
-   * construction — replay, fork, or resume — and were never published on the
-   * `session/event` firehose (constructor seeds do not emit), so consumers
-   * that replay the log as a publication substitute (telemetry adoption)
-   * start here. Distinct from {@link inheritedEventCount}, the DURABLE
-   * fork-lineage cut: a resumed session's constructor seed is its full stored
-   * log, while the inherited count keeps the original fork value — this field is the
-   * in-process construction fact.
+   * The constructor seed length (0 without one), before any marker appended
+   * during construction. Seed events never publish on `session/event`. A
+   * marker appended before the store attaches occupies this seq without
+   * publishing either; otherwise this seq is available for the next append.
    *
-   * Not persisted itself: a seeded session projects it into the log as the
-   * `session/end-seed` event, which is what a consumer reading STORED history
-   * reads. Locate the LAST such event, not necessarily one at this seq — a
-   * seed already ending in one is not re-marked, so reopening an untouched
-   * session leaves that event at a smaller seq than `firstLiveSeq`. Prefer
-   * this field in-process: it is exact before the marker reaches storage.
-   *
-   * When this lifecycle appends the marker, it occupies this seq before the
-   * store attaches and therefore does not publish either. Otherwise this seq
-   * holds an ordinary published write.
+   * This in-process offset is not persisted. A fork seed can already contain
+   * the child's inherited marker and synthetic closers, so its child-owned
+   * history starts at {@link inheritedEventCount}, before this offset. A
+   * resumed Session's seed contains its full stored log, while its inherited
+   * count keeps the durable fork cut. Consumers needing complete canonical
+   * history start at seq 0.
    */
   readonly firstLiveSeq: SessionLogOffset
+
+  /**
+   * First event produced for this object lifecycle. A new fork includes its
+   * child-owned seed marker and closers; a restored Session starts after its
+   * complete stored prefix. This in-process capture offset is not persisted.
+   */
+  readonly firstLifecycleSeq: SessionLogOffset
 
   /**
    * Create a detached session by validating and snapshotting borrowed seed
@@ -481,46 +579,63 @@ export class Session {
    * @param seed - optional borrowed replay or fork events.
    * @param header - optional borrowed storage metadata.
    * @param inheritedEventCount - exact fork-inherited prefix length for a seeded header.
+   * @param projections - pure interpreters for plugin-owned message changes.
    * @returns a detached session.
+   * @throws when a seed event requires a missing message interpreter or fails validation.
    */
   static create(
     id: SessionId,
     seed?: readonly SessionEvent[],
     header?: SessionHeader,
     inheritedEventCount?: SessionLogOffset,
+    projections?: readonly SessionMessageProjection[],
   ): Session {
-    return new Session(id, seed, header, 'snapshot', inheritedEventCount)
+    return new Session(id, seed, header, 'snapshot', inheritedEventCount, projections)
   }
 
   /**
-   * Restore a detached session by taking ownership of fresh persistence values.
-   * The storage format, event envelopes, sequence continuity, surface transitions,
-   * and header fields are validated before the restored objects are frozen.
+   * Restore a detached session by adopting an independently owned or deeply frozen seed.
+   * Runtime-required event fields, event envelopes, sequence continuity, surface
+   * transitions, and header fields are validated without copying or freezing events.
+   * Embedded Assistant streams remain opaque until a stream consumer or storage
+   * verifier reads them.
    * @param id - restored session identity.
-   * @param seed - fresh detached events whose ownership is transferred.
-   * @param header - fresh detached metadata whose ownership is transferred.
+   * @param seed - independently owned or deeply frozen events.
+   * @param header - independently owned storage metadata.
    * @param inheritedEventCount - exact fork-inherited prefix length decoded from storage.
+   * @param eventState - aliasing state carried from the operation that produced the seed.
+   * @param projections - pure interpreters for plugin-owned message changes.
    * @returns a restored detached session.
+   * @throws when a seed event requires a missing message interpreter or fails validation.
    */
   static fromRestore(
     id: SessionId,
     seed: readonly SessionEvent[],
     header: SessionHeader,
     inheritedEventCount: SessionLogOffset,
+    eventState: SessionSeedEventState,
+    projections?: readonly SessionMessageProjection[],
   ): Session {
-    return new Session(id, seed, header, 'restore', inheritedEventCount)
+    return new Session(
+      id,
+      seed,
+      header,
+      eventState,
+      inheritedEventCount,
+      projections,
+    )
   }
 
   private constructor(
     id: SessionId,
     seed?: readonly SessionEvent[],
     header?: SessionHeader,
-    mode: 'snapshot' | 'restore' = 'snapshot',
+    mode: 'snapshot' | SessionSeedEventState = 'snapshot',
     suppliedInheritedEventCount?: SessionLogOffset,
+    projections: readonly SessionMessageProjection[] = [],
   ) {
-    const restoredHeader = mode === 'restore'
-      ? validateRestoredSessionHeader(id, header)
-      : undefined
+    this.surfaceManager = new SurfaceManager(this.log, SessionLogOffset(0), projections)
+    const restoredHeader = mode === 'snapshot' ? undefined : validateRestoredSessionHeader(id, header)
     if (seed !== undefined) {
       // Validate the seed to the SAME invariants `append` enforces, so a
       // replay/fork (`ctx.sessions.create(id, { seed })`) cannot construct a
@@ -532,12 +647,11 @@ export class Session {
       for (const [index, source] of seed.entries()) {
         // The seed is a persistence/replay boundary: validate and detach the
         // complete event in one lossless-JSON pass.
-        const snapshot = mode === 'restore' ? source : snapshotJsonValue(source)
+        const snapshot = mode === 'snapshot' ? snapshotJsonValue(source) : source
         if (snapshot === undefined) {
           throw new Error(`seed event at index ${index} is not losslessly JSON-serializable`)
         }
         assertSessionEventEnvelope(snapshot, index)
-        assertSupportedRequestHeader(snapshot.type, snapshot.data, `seed event at index ${index}`)
         if (snapshot.seq !== index) {
           throw new Error(`seed event at index ${index} has seq ${snapshot.seq} (expected ${index}); seed must be contiguous from 0`)
         }
@@ -549,7 +663,7 @@ export class Session {
         } catch (error: unknown) {
           throw new Error(`invalid seed event at index ${index}: ${error instanceof Error ? error.message : 'invalid surface metadata'}`)
         }
-        this.log.push(mode === 'restore' ? freezeRestoredObject(snapshot) : deepFreeze(snapshot))
+        this.log.push(mode === 'snapshot' ? deepFreeze(snapshot) : snapshot)
       }
     }
     this.firstLiveSeq = SessionLogOffset(this.log.length)
@@ -567,12 +681,22 @@ export class Session {
     if (inheritedEventCount > this.log.length) {
       throw new Error('session inherited event count exceeds its event log')
     }
+    const seedMarker = this.log[inheritedEventCount]
+    const markedSeed = seedMarker?.type === 'session/end-seed' && seedMarker.data.inherited === true
+    if (mode === 'snapshot' && this.header.isSeeded && inheritedEventCount !== this.log.length && !markedSeed) {
+      throw new Error('seeded session constructor seed must equal its inherited prefix or mark its inherited cut')
+    }
+    if (markedSeed && this.log.slice(inheritedEventCount + 1).some(event => event.type === 'session/end-seed' && event.data.inherited === true)) {
+      throw new Error('session inherited event count must identify the final inherited marker')
+    }
     this.inheritedEventCount = inheritedEventCount
-    // Appended here so the marker is already in `events` when a backend
-    // captures the creation seed: no load-time write. Re-marking is skipped
-    // because a cold session is resumed on first touch, so repeatedly opening
-    // one must not grow its log per open.
-    if (seed !== undefined && this.log.at(-1)?.type !== 'session/end-seed') {
+    this.firstLifecycleSeq = mode === 'snapshot' && this.header.isSeeded ? inheritedEventCount : this.firstLiveSeq
+    // A fresh seeded child always owns one tagged marker at its inherited cut,
+    // even when the copied prefix already ends in an ancestor marker. Restore
+    // retains that durable marker and appends only the ordinary resume marker.
+    if (seed !== undefined && mode === 'snapshot' && this.header.isSeeded && !markedSeed) {
+      this.append('session/end-seed', { inherited: true })
+    } else if (seed !== undefined && !(mode === 'snapshot' && this.header.isSeeded) && this.log.at(-1)?.type !== 'session/end-seed') {
       this.append('session/end-seed', {})
     }
   }
@@ -582,6 +706,8 @@ export class Session {
 
   /**
    * Return the immutable event stored at one exact sequence number.
+   * @deprecated Existing logic may remain unmigrated for now, but new calls are prohibited.
+   * See the [Agent Note](../../../../.agents/notes/implemented/architecture/2026-09-09-deprecate-synchronous-session-event-reads.md).
    * @param seq - event sequence number.
    * @returns the accepted event, or undefined when the log does not contain it.
    */
@@ -593,6 +719,8 @@ export class Session {
    * Materialize an immutable snapshot of a half-open event sequence range.
    * A full current snapshot is reused until the next append; every previously
    * returned snapshot remains stable after later appends.
+   * @deprecated Existing logic may remain unmigrated for now, but new calls are prohibited.
+   * See the [Agent Note](../../../../.agents/notes/implemented/architecture/2026-09-09-deprecate-synchronous-session-event-reads.md).
    * @param fromSeq - non-negative inclusive sequence number; defaults to the log start.
    * @param toSeqExclusive - non-negative exclusive sequence number; defaults to the current end.
    * @returns a frozen array of the selected deeply frozen events.
@@ -610,9 +738,12 @@ export class Session {
 
   /**
    * Return this Session's events after its fork-inherited prefix.
+   * @deprecated Existing logic may remain unmigrated for now, but new calls are prohibited.
+   * See the [Agent Note](../../../../.agents/notes/implemented/architecture/2026-09-09-deprecate-synchronous-session-event-reads.md).
    * @returns a fresh array containing child-owned events in log order.
    */
   ownEvents(): readonly SessionEvent[] {
+    // oxlint-disable-next-line typescript/no-deprecated -- Deprecated reader delegates to the deprecated range read.
     return this.snapshotEvents(this.inheritedEventCount)
   }
 
@@ -637,6 +768,9 @@ export class Session {
    * the log, the append is committed: observer failures are logged and
    * contained per listener, so they do not change the return value or prevent
    * later listeners from observing the same accepted event.
+   * Independent Sessions append without notifying store observers. Once a store
+   * prepares or enters the instance, writes require a completed creation
+   * announcement and remain disabled after removal.
    *
    * @param type - The event type (key of {@link SessionEventMap}).
    * @param data - The event payload; must be JSON-serializable.
@@ -647,14 +781,18 @@ export class Session {
    *   declare how it joins the surface, the sole source of derived model
    *   history) and
    *   rejected by the compiler for non-surface types like `turn/start` or
-   *   `assistant/chunk`.
+   *   `assistant/attempt`. Assistant messages embed their exact provider
+   *   stream and cannot cite top-level source events.
    * @returns the logged event — its assigned `seq`/`time` plus the SNAPSHOT of
    *   `data` that entered the log, so reading `event.data` back sees the logged
    *   value, never the caller's still-mutable input.
-   * @throws if `data` or surface metadata is not losslessly JSON-serializable
+   * @throws if a store-owned Session is unentered or its creation announcement
+   *   has not completed, or if `data` or surface
+   *   metadata is not losslessly JSON-serializable
    *   (BigInt, function, symbol, undefined, negative zero, non-finite number,
    *   circular reference, sparse array, or an exotic object such as
    *   Map/Set/Date/class instance), or when the candidate violates the
+   *   request-header empty-field or tool-error consistency rules, or the
    *   canonical surface contract (marker shape and eligibility, unique
    *   earlier source-event references, positional replacement validity, and complete
    *   shadowed-node coverage). One iterative pass reads, validates, and
@@ -668,8 +806,9 @@ export class Session {
   append<T extends SessionEventType>(
     type: T,
     data: SessionEventMap[T],
-    ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent] : []
+    ...opts: T extends SurfaceEventType ? [opts: SurfaceIntent<T>] : []
   ): SessionEvent<T> {
+    this.publicationEntry()
     const surfaceOpts: SurfaceIntent | undefined = opts[0]
     const surfaceMetadata = {
       ...surfaceOpts?.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: surfaceOpts.sourceEventSeqs },
@@ -679,15 +818,12 @@ export class Session {
     if (dataSnapshot === undefined) {
       throw new Error(`session event "${type}" carries non-JSON-serializable data`)
     }
-    assertSupportedRequestHeader(type, dataSnapshot, `session event "${type}"`)
     const surfaceMetadataSnapshot = snapshotJsonValue(surfaceMetadata)
     if (surfaceMetadataSnapshot === undefined) {
       throw new Error(`session event "${type}" carries non-JSON-serializable surface metadata`)
     }
-    const entry = attachments.get(this)
-    if (entry?.appending) {
-      throw new Error('session append cannot reenter while another append is being published')
-    }
+    // Payload getters can detach the Session while the snapshots are read.
+    const entry = this.publicationEntry()
     const event = deepFreeze({
       type,
       seq: SessionSeq(this.log.length),
@@ -695,25 +831,82 @@ export class Session {
       data: dataSnapshot,
       ...(surfaceMetadataSnapshot as { surfaceOp?: unknown; sourceEventSeqs?: unknown }),
     } as unknown as SessionEvent<T>)
-    this.surfaceManager.validateNext(event as SessionEvent)
+    validateSessionEventData(event, `session event "${type}" at seq ${event.seq}`)
+    this.commit(event as SessionEvent, entry)
+    return event
+  }
+
+  static {
+    commitPluginRecord = (session, type, data) => session.#appendRecord(type, data)
+  }
+
+  /**
+   * Commit one plugin record; {@link appendPluginRecord} is the only caller.
+   * @param type - record type, checked against the plugin record grammar.
+   * @param data - JSON payload, snapshotted before it enters the log.
+   * @returns the record's sequence number.
+   */
+  #appendRecord(type: PluginRecordType, data: unknown): SessionSeq {
+    this.publicationEntry()
+    const dataSnapshot = snapshotJsonValue(data)
+    if (dataSnapshot === undefined) {
+      throw new Error(`plugin record "${type}" carries non-JSON-serializable data`)
+    }
+    const entry = this.publicationEntry()
+    const record: unknown = deepFreeze({
+      type,
+      seq: SessionSeq(this.log.length),
+      time: Date.now(),
+      data: dataSnapshot,
+      ignorable: true,
+    })
+    assertPluginRecordEvent(record)
+    this.commit(record, entry)
+    return record.seq
+  }
+
+  /**
+   * Require announced membership for store-owned Sessions and refuse reentrant publication.
+   * @returns the current store attachment, or undefined for an independent Session.
+   */
+  private publicationEntry(): SessionEntry | undefined {
+    const entry = attachments.get(this)
+    if (entry === null) {
+      throw new Error(`session "${this.id}" cannot append outside a SessionStore`)
+    }
+    if (entry !== undefined && entry.announcement !== 'complete') {
+      throw new Error(`session "${this.id}" cannot append before session/created completes`)
+    }
+    if (entry?.appending) {
+      throw new Error('session append cannot reenter while another append is being published')
+    }
+    return entry
+  }
+
+  /**
+   * Accept one frozen candidate at the next sequence number, enter it into the
+   * log, and notify `session/event` observers with per-listener containment.
+   * @param event - the candidate built at the current log length.
+   * @param entry - the attachment read before the candidate was built.
+   */
+  private commit(event: SessionEvent, entry: SessionEntry | undefined): void {
+    this.surfaceManager.validateNext(event)
 
     if (entry !== undefined) entry.appending = true
     try {
-      let callbacks: SessionCallback[] | undefined
       const callbackArgs: unknown[] = [this, event]
-      if (entry !== undefined) {
-        callbacks = collectSessionCallbacks(entry.emitCtx, [entry.carrier, 'session/event', ...callbackArgs])
-      }
-      this.log.push(event as SessionEvent)
+      const callbacks = entry === undefined
+        ? undefined
+        : collectSessionCallbacks(entry.emitCtx, [entry.carrier, 'session/event', ...callbackArgs])
+      this.log.push(event)
       this.eventsSnapshot = undefined
-      if (callbacks !== undefined && entry !== undefined) {
+      if (entry !== undefined && callbacks !== undefined) {
         invokeContainedSessionObservers(entry.emitCtx, 'session/event', entry.id, callbackArgs, callbacks)
       }
-      return event
     } finally {
       if (entry !== undefined) {
         entry.appending = false
-        if (entry.detachRequested && !entry.announcing) entry.detach()
+        if (entry.detachRequested && entry.announcement !== 'dispatching') entry.detach()
       }
     }
   }
@@ -762,11 +955,27 @@ export class Session {
     return this.contextFold
   }
 
+  /** Cached historical tool definitions and updates for request projection. */
+  private readonly toolHistoryProjection = new ToolHistoryProjection()
+  /** Index of the next committed event not yet consumed by the tool-history fold. */
+  private toolHistorySeq = 0
+
+  /**
+   * Fold unseen committed events into capability-independent tool history.
+   * Initial access reconstructs inherited history; later reads consume only new events.
+   * @returns an immutable snapshot for LLM request projection, including historical addition definitions.
+   */
+  toolHistory(): ToolHistory {
+    for (const event of this.log.slice(this.toolHistorySeq)) this.toolHistoryProjection.apply(event)
+    this.toolHistorySeq = this.log.length
+    return this.toolHistoryProjection.snapshot()
+  }
+
   /** The derived-message cache: frozen projections, extended per unseen node. */
   private derived: Message[] = []
   /** Surface position (nodes projected) the cache has reached. */
   private derivedNodes = 0
-  /** {@link SurfaceManager.replaceGeneration} the cache was built under. */
+  /** {@link SurfaceManager.contentGeneration} the cache was built under. */
   private derivedGeneration = 0
 
   /**
@@ -776,21 +985,21 @@ export class Session {
    * append records its `surfaceOp`, so a raw event with no marker (a chunk, a
    * turn boundary) is correctly absent, and a compaction `replace` deletes the
    * shadowed nodes from the derivation. The projection rules are
-   * {@link deriveEventMessage}, folded per node.
+   * {@link deriveEventMessage}, with logged message projections applied
+   * without changing node membership or message identity.
    *
-   * CACHED: each surface node is projected exactly once, when first seen — a
-   * call costs O(new nodes), and a surface rewrite (a `replace`;
-   * {@link SessionSurface.replaceGeneration}) rebuilds. The returned array is
+   * CACHED: pure tail growth costs O(new nodes); a replacement or message projection
+   * ({@link SessionSurface.contentGeneration}) rebuilds. The returned array is
    * a fresh snapshot per call (later appends never grow an array a caller
    * already holds); the `Message` objects in it are SHARED and **deep-frozen**.
-   * Their content reuses the already frozen durable event data, so the cache
-   * needs no second deep clone and consumers still cannot mutate the log.
+   * Unchanged content reuses frozen event data; projected blocks are frozen
+   * derived copies. Consumers cannot mutate the log through either form.
    * @returns a fresh array of the shared, frozen derived history.
    */
   deriveMessages(): Message[] {
     const surface = this.surface
     const nodes = surface.nodes
-    const generation = surface.replaceGeneration
+    const generation = surface.contentGeneration
     if (generation !== this.derivedGeneration) {
       this.derived = []
       this.derivedNodes = 0
@@ -811,13 +1020,13 @@ export class Session {
   }
 
   /**
-   * Instance face of the pure per-node `deriveEventMessage` export from
-   * `surface.ts`.
+   * Project one event with all committed message projections applied.
+   * The original durable event remains unchanged.
    * @param event - the event to project.
    * @returns the derived message, or null when the event produces none.
    */
   deriveEventMessage(event: SessionEvent): Message | null {
-    return deriveEventMessage(event)
+    return this.surfaceManager.deriveEventMessage(event)
   }
 }
 
@@ -828,16 +1037,14 @@ export type SessionForkSource = Session | SessionId
  * Rejection codes for session forking: the fork source id is unknown to the
  * live store (`SESSION_NOT_FOUND`) or names a session object that is not the
  * store's live instance (`SESSION_NOT_LIVE`); the requested child id is
- * already taken (`SESSION_ALREADY_EXISTS`); the boundary is not a contiguous
- * existing seq (`INVALID_BOUNDARY`); or the selected prefix ends inside an
- * open turn (`OPEN_TURN`).
+ * already taken (`SESSION_ALREADY_EXISTS`); or the boundary is not a contiguous
+ * existing seq (`INVALID_BOUNDARY`).
  */
 export type SessionForkErrorCode =
   | 'SESSION_NOT_FOUND'
   | 'SESSION_NOT_LIVE'
   | 'SESSION_ALREADY_EXISTS'
   | 'INVALID_BOUNDARY'
-  | 'OPEN_TURN'
 
 /** Typed error for session fork rejections. */
 export class SessionForkError extends Error {
@@ -857,6 +1064,29 @@ export class SessionForkError extends Error {
 export class SessionStore extends Service {
   private store = new Map<SessionId, SessionEntry>()
   private counter = 0
+  private readonly projections: SessionMessageProjection[] = []
+
+  /** Borrowed definitions for detached replay; contributions live until their registering fibers unload. */
+  get messageProjections(): readonly SessionMessageProjection[] {
+    return this.projections
+  }
+
+  /**
+   * Register one event interpreter for live creation, restore, and fork.
+   * Disposing the contribution makes sessions that used it refuse further derivation.
+   * @param projection - pure definition owned by the event's plugin.
+   * @returns the fiber-owned disposer.
+   * @throws when another definition already owns this event type.
+   */
+  registerMessageProjection(projection: SessionMessageProjection): () => Promise<void> {
+    if (this.projections.some(item => item.type === projection.type)) {
+      throw new Error(`session message projection "${projection.type}" is already registered`)
+    }
+    return this.ctx.effect(() => {
+      this.projections.push(projection)
+      return () => { this.projections.splice(this.projections.indexOf(projection), 1) }
+    }, 'sessions.registerMessageProjection()')
+  }
 
   constructor(ctx: Context) {
     super(ctx, 'sessions')
@@ -864,6 +1094,7 @@ export class SessionStore extends Service {
       typeCtx.typert.lookups.register('session', {
         parameter: 'session',
         wire: 'sessionId',
+        resource: 'session',
         hostTypeSymbol: '@deepseek-ai/dsh-session#Session',
         wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
         resolve: sessionId => this.get(sessionId),
@@ -916,11 +1147,10 @@ export class SessionStore extends Service {
    *
    * @param id - the session id; omitted, the store mints `session-<n>`.
    * @param options - seed events and/or creation metadata for the header. With
-   *   `seedSource: 'persistence'`, metadata and events must be fresh detached
-   *   graphs whose ownership transfers to this call: they are validated and
-   *   frozen in place through {@link Session.fromRestore}, so the caller must
-   *   retain no mutable aliases.
-   * @returns the constructed session, NOT yet in the store.
+   *   `eventState`, every seed event is either independently owned or any
+   *   shared value is deeply frozen; {@link Session.fromRestore} validates and
+   *   adopts those values without copying or freezing them.
+   * @returns the store-owned session, not yet entered and read-only until announced.
    * @throws if a session with `id` already exists, metadata is not a plain
    *   lossless-JSON record with valid scalar fields, or `meta.cwd` is a
    *   non-absolute path.
@@ -934,8 +1164,28 @@ export class SessionStore extends Service {
       sessionId = brandString<SessionId>(id)
     }
     if (this.store.has(sessionId)) throw new Error(`session "${sessionId}" already exists`)
-    if (options?.seedSource === 'persistence') {
-      return Session.fromRestore(sessionId, options.seed, options.meta, options.inheritedEventCount)
+    if (options !== undefined) {
+      const { eventState } = options
+      switch (eventState) {
+        case 'detached':
+        case 'shared-frozen': {
+          const session = Session.fromRestore(
+            sessionId,
+            options.seed,
+            options.meta,
+            options.inheritedEventCount,
+            eventState,
+            this.projections,
+          )
+          attachments.set(session, null)
+          return session
+        }
+        case undefined:
+          break
+        /* v8 ignore next -- closed-union exhaustiveness guard */
+        default:
+          assertNever(eventState, 'SessionStore.prepare event state')
+      }
     }
     const seed = options?.seed
     const meta = options?.meta
@@ -950,12 +1200,15 @@ export class SessionStore extends Service {
       ...meta?.delegationDepth === undefined ? {} : { delegationDepth: meta.delegationDepth },
       ...meta?.agentPreset === undefined ? {} : { agentPreset: meta.agentPreset },
     }
-    return Session.create(sessionId, seed, header, options?.inheritedEventCount)
+    const session = Session.create(sessionId, seed, header, options?.inheritedEventCount, this.projections)
+    attachments.set(session, null)
+    return session
   }
 
   /**
-   * Enter a {@link prepare}d session into the store: install the module-private
-   * append publication hooks and add it to the store. Returns the DETACH
+   * Enter a session into the store: install the module-private
+   * append publication hooks and add it to the store. Writes remain disabled
+   * until {@link announce} completes successfully. Returns the DETACH
    * disposer (hooks + store removal). Does NOT emit `session/created` —
    * the caller yields this disposer inside its effect and THEN calls
    * {@link announce}, so a throwing `session/created` listener rolls the attach
@@ -969,7 +1222,7 @@ export class SessionStore extends Service {
    * the two back-to-back so they never trip this, but the public API cannot
    * assume that.
    *
-   * @param session - a {@link prepare}d session not yet in the store.
+   * @param session - an unentered session; independent instances become store-owned.
    * @returns the detach disposer (publication hooks + store removal). When called from
    *   a synchronous `session/created` listener, removal and disposal wait until
    *   that creation dispatch unwinds.
@@ -981,14 +1234,13 @@ export class SessionStore extends Service {
     // This is the authoritative collision boundary after arbitrary unpublished
     // preparation. Only one exact same-id transaction can publish.
     if (this.store.has(id)) throw new Error(`session "${id}" already exists`)
-    if (attachments.has(session)) throw new Error(`session "${id}" is already attached to a store`)
+    if (attachments.get(session) != null) throw new Error(`session "${id}" is already attached to a store`)
     const entry: SessionEntry = {
       id,
       session,
       carrier,
       emitCtx: this.ctx,
-      announced: false,
-      announcing: false,
+      announcement: 'pending',
       appending: false,
       detachRequested: false,
       detach: () => { this.detachEntered(entry) },
@@ -1002,7 +1254,7 @@ export class SessionStore extends Service {
       // A lifecycle listener may own the advanced detach capability. Keep the
       // entry and its publication hooks live until synchronous creation or append
       // publication unwinds, then publish the paired disposal edge.
-      if (entry.announcing || entry.appending) {
+      if (entry.announcement === 'dispatching' || entry.appending) {
         entry.detachRequested = true
         return
       }
@@ -1019,28 +1271,28 @@ export class SessionStore extends Service {
     /* v8 ignore next -- enter() rejects replacement while this single-shot detach capability is live. */
     if (this.store.get(entry.id) !== entry) return
     this.store.delete(entry.id)
-    attachments.delete(entry.session)
-    if (entry.announced) this.emitDisposed(entry)
+    attachments.set(entry.session, null)
+    if (entry.announcement !== 'pending') this.emitDisposed(entry)
   }
 
   /** Emit `session/created` exactly once for an {@link enter}ed session (with
    * the carrier {@link enter} captured). Separate from {@link enter} so the
    * caller can yield the detach disposer first (rollback safety — see
-   * {@link enter}).
+   * {@link enter}). The Session remains read-only throughout synchronous
+   * dispatch; successful completion enables appends. A failed announcement
+   * leaves it read-only and cannot be retried.
    * @param session - the entered session to announce to listeners.
    * @throws if the session is not live or its announcement already began,
    *   including a reentrant call from a creation listener. */
   announce(session: Session): void {
     const entry = this.liveEntryFor(session)
-    if (entry.announced || entry.announcing) {
+    if (entry.announcement !== 'pending') {
       throw new Error(`session "${entry.id}" was already announced`)
     }
-    // Mark before emit: Cordis emit may deliver to earlier listeners and then
-    // throw. Rollback must still pair that partial creation with disposal, and
-    // a listener cannot recursively create a second lifecycle edge.
-    entry.announced = true
+    // Partial creation dispatch still requires disposal on rollback; listeners
+    // cannot recursively begin another announcement.
     const callbackArgs: unknown[] = [session]
-    entry.announcing = true
+    entry.announcement = 'dispatching'
     try {
       const callbacks = collectSessionCallbacks(this.ctx, [entry.carrier, 'session/created', session])
       for (const callback of callbacks) {
@@ -1054,9 +1306,12 @@ export class SessionStore extends Service {
           this.ctx.logger.warn(`session "${entry.id}": session/created listener rejected: ${String(error)}`)
         })
       }
+      entry.announcement = 'complete'
+    } catch (error: unknown) {
+      entry.announcement = 'failed'
+      throw error
     } finally {
-      entry.announcing = false
-      if (entry.detachRequested && !entry.appending) entry.detach()
+      if (entry.detachRequested) entry.detach()
     }
   }
 
@@ -1077,8 +1332,8 @@ export class SessionStore extends Service {
    * store owns the carrier, so callers (the checkpoint policy's per-request
    * barrier, goal-round-driver's idle checkpoint, teardown drains, and consumers
    * that flush themselves before reading storage) must come through here
-   * rather than dispatch a raw `ctx.parallel('session/flush', …)` — one owner,
-   * one spelling, and the scoped-dispatch invariant can pin it.
+   * rather than dispatch a raw `ctx.parallel('session/flush', …)` — one owner
+   * and one spelling.
    * @param session - the session whose buffered events must reach durable storage.
    * @returns whether at least one durability listener participated, after every
    *   listener has settled successfully.
@@ -1106,7 +1361,7 @@ export class SessionStore extends Service {
   /** Return the exact live entry; detached/prepared objects reject. */
   private liveEntryFor(session: Session): SessionEntry {
     const entry = attachments.get(session)
-    if (entry === undefined || this.store.get(entry.id) !== entry) {
+    if (entry == null || this.store.get(entry.id) !== entry) {
       throw new Error(`session "${session.id}" is not live in this store`)
     }
     return entry
@@ -1130,10 +1385,12 @@ export class SessionStore extends Service {
   }
 
   /**
-   * Create a live child session from a stable prefix of a live source.
+   * Create an independent live session from an exact prefix of a live source.
    * `boundary` is an inclusive source event seq; omitted means the source's
-   * current last event. The selected slice may end with a between-turn event
-   * but must not end inside an open turn.
+   * current last event. An open tail receives synthetic tool results and
+   * step/turn closers with the forked cause. Closed steps and turns remain
+   * unchanged, including any failed tool calls already missing results.
+   * `inheritedEventCount` counts only copied source events, excluding these closers.
    *
    * @param source - Live source session object or id.
    * @param boundary - Inclusive source event seq to fork through; omitted means
@@ -1148,59 +1405,53 @@ export class SessionStore extends Service {
       throw new SessionForkError(`session "${childSessionId}" already exists`, 'SESSION_ALREADY_EXISTS')
     }
     const liveSource = this._resolveForkSource(source)
-    const seed = this._forkSeed(liveSource, boundary)
+    // oxlint-disable-next-line typescript/no-deprecated -- Existing fork snapshot read; migration deferred.
+    const events = liveSource.snapshotEvents()
+    const resolved = this._forkBoundary(liveSource.id, events, boundary)
+    const seed = resolved === undefined ? [] : buildForkSeed(events, resolved)
     return this.create(childSessionId, {
       seed,
-      inheritedEventCount: SessionLogOffset(seed.length),
+      inheritedEventCount: SessionLogOffset(resolved === undefined ? 0 : resolved + 1),
       meta: {
         ...liveSource.header.cwd !== undefined ? { cwd: liveSource.header.cwd } : {},
-        parentSession: liveSource.id,
         isSeeded: true,
       },
     })
   }
 
-  private _forkSeed(session: Session, requestedBoundary: SessionSeq | undefined): readonly SessionEvent[] {
-    const lastEvent = session.snapshotEvents().at(-1)
+  private _forkBoundary(
+    sessionId: SessionId, events: readonly SessionEvent[], requestedBoundary: SessionSeq | undefined,
+  ): SessionSeq | undefined {
+    const lastEvent = events.at(-1)
     let boundary: SessionSeq
     if (requestedBoundary !== undefined) {
       boundary = requestedBoundary
     } else {
-      if (lastEvent === undefined) return []
+      if (lastEvent === undefined) return undefined
       boundary = lastEvent.seq
     }
     if (!Number.isSafeInteger(boundary) || boundary < 0) {
       throw new SessionForkError(
-        `fork boundary for session "${session.id}" must be a non-negative safe integer, got ${String(boundary)}`,
+        `fork boundary for session "${sessionId}" must be a non-negative safe integer, got ${String(boundary)}`,
         'INVALID_BOUNDARY',
       )
     }
-    if (boundary >= session.seq) {
+    if (boundary >= events.length) {
       const lastSeq = lastEvent?.seq
       throw new SessionForkError(
-        `fork boundary ${boundary} does not exist in session "${session.id}" (last seq: ${lastSeq ?? 'none'})`,
+        `fork boundary ${boundary} does not exist in session "${sessionId}" (last seq: ${lastSeq ?? 'none'})`,
         'INVALID_BOUNDARY',
       )
     }
 
-    const boundaryEvent = session.eventAt(boundary)
+    const boundaryEvent = events[boundary]
     if (boundaryEvent === undefined || boundaryEvent.seq !== boundary) {
       throw new SessionForkError(
-        `fork boundary ${boundary} does not match a contiguous event seq in session "${session.id}"`,
+        `fork boundary ${boundary} does not match a contiguous event seq in session "${sessionId}"`,
         'INVALID_BOUNDARY',
       )
     }
-    const events = session.snapshotEvents(SessionLogOffset(0), SessionLogOffset(boundary + 1))
-    const lastTurnBoundary = events
-      .findLast(event => event.type === 'turn/start' || event.type === 'turn/end')
-    if (lastTurnBoundary?.type === 'turn/start') {
-      throw new SessionForkError(
-        `fork boundary ${boundary} in session "${session.id}" ends inside open turn ${lastTurnBoundary.data.turn}`,
-        'OPEN_TURN',
-      )
-    }
-
-    return events
+    return boundary
   }
 
   private _resolveForkSource(source: SessionForkSource): Session {

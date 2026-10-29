@@ -1,14 +1,17 @@
 import { describe, expect, expectTypeOf, it, vi } from 'vitest'
 import type { PromptContentPart as AttachmentPromptContentPart } from '@deepseek-ai/dsh-attachment/types'
-import { SessionSeq, type SessionSeqCursor } from '@deepseek-ai/dsh-session/types'
+import { SessionSeq, type SessionId, type SessionSeqCursor } from '@deepseek-ai/dsh-session/types'
 import {
-  MutableSessionEventSource, type SessionLiveEventEntry,
+  MutableSessionEventSource, type SessionAssistantSettlementEntry,
+  type SessionLiveEventEntry, type SessionTransientEventEntry,
 } from '../src/client/contract/events.ts'
+import { LlmAttemptId } from '@deepseek-ai/dsh-llm/brand'
 import type { ISession } from '../src/client/contract/session.ts'
 import type { ProjectionsBaseline } from '../src/client/sessions/projection-store.ts'
 import { ProjectionValueStore } from '../src/client/sessions/projection-store.ts'
 import type { PromptContentPart as SessionPromptContentPart, SessionPageRequest } from '../src/types.ts'
 import { ev, plainTurn } from './event-script.client.ts'
+import { history, pageRule } from './remote/session.client.ts'
 
 type RenameSuccess = Extract<Awaited<ReturnType<ISession['rename']>>, { readonly ok: true }>
 
@@ -20,6 +23,35 @@ function entry(seq: SessionSeq): SessionLiveEventEntry {
       seq,
       time: seq,
       data: { turn: seq },
+    },
+  }
+}
+
+function transient(attemptId: string, seq = 1.5): SessionTransientEventEntry {
+  return {
+    type: 'transient',
+    event: {
+      type: 'assistant/live-chunk',
+      seq,
+      time: 1,
+      data: {
+        attemptId: LlmAttemptId(attemptId),
+        turn: 1,
+        step: 1,
+        chunk: { type: 'text-delta', index: 0, text: 'live' },
+      },
+    },
+  }
+}
+
+function assistantSettlement(seq: SessionSeq): SessionAssistantSettlementEntry {
+  return {
+    type: 'event',
+    event: {
+      type: 'assistant/attempt',
+      seq,
+      time: seq,
+      data: { turn: 1, step: 1, stream: [] },
     },
   }
 }
@@ -39,11 +71,26 @@ describe('Client Session contracts', () => {
     expectTypeOf<RenameSuccess['value']['seq']>().toEqualTypeOf<SessionSeq>()
     expectTypeOf<ProjectionValueStore['apply']>().parameter(2).toEqualTypeOf<SessionSeqCursor>()
     expectTypeOf<ProjectionsBaseline['asOfSeq']>().toEqualTypeOf<SessionSeqCursor>()
-    expectTypeOf<SessionPageRequest['throughSeq']>().toEqualTypeOf<number>()
+    expectTypeOf<SessionPageRequest['throughSeq']>().toEqualTypeOf<number | undefined>()
   })
 
-  it('keeps its catalog-visible prompt parts identical to attachment intake', () => {
-    expectTypeOf<SessionPromptContentPart>().toEqualTypeOf<AttachmentPromptContentPart>()
+  it('returns the current page cursor when throughSeq is omitted and preserves explicit cuts', async () => {
+    const address = { kind: 'session', sessionId: 'page-fixture' as SessionId } as const
+    const rule = pageRule(history(plainTurn(SessionSeq(0), 1, 'question', 'answer')))
+    const current = await rule({ address })
+    expect(current).toMatchObject({ ok: true, value: { cursor: 5, hasMore: false } })
+    const cut = await rule({ address, throughSeq: 2 })
+    expect(cut).toMatchObject({ ok: true, value: { cursor: 2, hasMore: false } })
+    if (!cut.ok) throw new Error('expected a successful history page')
+    expect(cut.value.records.map(record => record.event.seq)).toEqual([0, 1, 2])
+    await expect(rule({ address, throughSeq: -1 })).resolves.toEqual({
+      ok: true, value: { cursor: -1, records: [], hasMore: false },
+    })
+  })
+
+  it('keeps its text and image prompt parts identical to attachment intake', () => {
+    expectTypeOf<Exclude<SessionPromptContentPart, { type: 'file' }>>()
+      .toEqualTypeOf<AttachmentPromptContentPart>()
   })
 
   it('publishes exact replace, prepend, and append event-window changes', () => {
@@ -103,6 +150,36 @@ describe('Client Session contracts', () => {
     expect(after.entries).toEqual([first, live])
     expect(after.entries).toBe(after.entries)
     expect(iterate).toHaveBeenCalledOnce()
+  })
+
+  it('publishes one exact Assistant settlement delta after retiring its transient rows', () => {
+    const feed = new MutableSessionEventSource()
+    const opening = entry(SessionSeq(1))
+    const live = transient('attempt-one')
+    const settlement = assistantSettlement(SessionSeq(2))
+    const later = entry(SessionSeq(3))
+    feed.replace([opening, live, later], false)
+
+    feed.settleAssistant(LlmAttemptId('attempt-one'), settlement)
+
+    expect(feed.getSnapshot()).toEqual({
+      entries: [opening, settlement, later],
+      hasMore: false,
+      revision: 2,
+      change: {
+        kind: 'settle-assistant',
+        attemptId: 'attempt-one',
+        entry: settlement,
+      },
+    })
+
+    feed.append(transient('attempt-two', 3.5))
+    feed.settleAssistant(LlmAttemptId('attempt-two'))
+    expect(feed.getSnapshot().entries).toEqual([opening, settlement, later])
+    expect(feed.getSnapshot().change).toEqual({
+      kind: 'settle-assistant',
+      attemptId: 'attempt-two',
+    })
   })
 
 })

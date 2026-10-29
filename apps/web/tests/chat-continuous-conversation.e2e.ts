@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
-import { ToolCallId, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { ToolCallId, expandAssistantStream, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { ReplayEntry, ReplayOverrideDoc } from '@deepseek-ai/dsh-llm-replay'
 import type { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import {
@@ -156,10 +156,11 @@ function assistantText(event: Extract<SessionEvent, { type: 'assistant/message' 
 }
 
 function toolResultText(event: Extract<SessionEvent, { type: 'tool/result' }>): string {
-  return event.data.message.content[0].content
-    .filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('')
+  let text = ''
+  for (const block of event.data.message.content) {
+    if (block.type === 'text') text += block.text
+  }
+  return text
 }
 
 function messageKey(event: SessionEvent<'user/message'>): string {
@@ -276,7 +277,11 @@ describe('web e2e: continuous conversation grown through the composer', () => {
       const turnEnds = turnEvents.filter((event): event is SessionEvent<'turn/end'> => (
         event.type === 'turn/end'
       ))
-      const chunks = turnEvents.filter(event => event.type === 'assistant/chunk')
+      const chunks = turnEvents.flatMap(event => (
+        event.type === 'assistant/message' || event.type === 'assistant/attempt'
+          ? expandAssistantStream(event.data.stream)
+          : []
+      ))
 
       expect(turnStarts).toHaveLength(1)
       expect(turnStarts[0]?.data.turn).toBe(spec.index)
@@ -311,7 +316,7 @@ describe('web e2e: continuous conversation grown through the composer', () => {
       })
       expect(results[0]?.data.turn).toBe(spec.index)
       expect(results[0]?.data.message.source.callId).toBe(spec.callId)
-      expect(results[0]?.data.message.content[0].isError).toBe(false)
+      expect(results[0]?.data.message.isError).toBe(false)
       expect(toolResultText(results[0]!)).toBe(`${spec.toolResultMarker}\n`)
 
       const toolRow = page.locator(`[data-chat-call-id="${spec.callId}"]`)
@@ -335,13 +340,16 @@ describe('web e2e: continuous conversation grown through the composer', () => {
     ))).toHaveLength(TURN_COUNT)
     expect(sessionEvents.flatMap(event =>
       event.type === 'request/header' ? [event.data.reason] : [])).toEqual(['initial'])
-    expect(await page.getByRole('button', { name: 'System prompt' }).count()).toBe(1)
+    expect(await page.getByRole('button', { name: 'System prompt' }).count()).toBe(0)
     expect(await page.locator(
-      '[data-chat-flow-kind="system-prompt"][hidden="until-found"]',
+      '[data-chat-flow-kind="system-prompt"]',
     ).count()).toBe(0)
     expect(specs.at(-1)?.prompt.length).toBeGreaterThan(4_000)
-    expect(sessionEvents.filter(event => (
-      event.type === 'assistant/chunk' && event.data.turn === TURN_COUNT
+    expect(sessionEvents.flatMap(event => (
+      (event.type === 'assistant/message' || event.type === 'assistant/attempt')
+        && event.data.turn === TURN_COUNT
+        ? expandAssistantStream(event.data.stream)
+        : []
     )).length).toBeGreaterThan(30)
     expect(consoleWarnings).toEqual([])
     expect(tripwire.pageErrors).toEqual([])

@@ -1,5 +1,8 @@
 # Test-only patch over the shipped headless profile. The driver points the
 # production telemetry row at its mock collector through the public env vars.
+- id: session-telemetry-otel
+  disabled: false
+
 - id: headless-startup
   disabled: true
 
@@ -35,3 +38,9 @@
     # shipped telemetry plugin deliberately owns none.
     - id: telemetry-redact-rule
       name: './telemetry-redact-rule.ts'
+
+- id: sandbox-policy
+  inject: []
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+    workspaceRoot: !!js process.cwd()

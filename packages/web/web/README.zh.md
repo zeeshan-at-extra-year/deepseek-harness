@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-任何插件或工具都可以通过 `dsh-web`（`ctx.web`）搜索 web 或抓取 URL，而无需绑定任何厂商的 API。搜索与抓取提供方以后端形式接入，服务按操作挑选一个可用的提供方，调用方无需追踪每次调用背后是哪家厂商。在构建 web 工具或其他后端时选择它；已交付的面向模型工具（`dsh-tool-web`）会自动挂载它。服务本身不发起网络调用、不注册面向模型的工具：搜索或抓取执行前必须已挂载提供方。搜索与抓取共用同一套选择策略、取消与错误词汇以及配置接口，因此「这个 harness 如何访问 web」只有一个归属方。
+使用 `dsh-web` 搜索 web 或抓取 URL，而无需让调用方依赖特定厂商。它为每项操作选择可用后端，并为调用方提供一致的取消、错误和结果上限。在调用 `ctx.web.search()` 或 `ctx.web.fetch()` 的插件或工具中选择它；已交付的 `dsh-tool-web` 工具会为你加载它。搜索或抓取需要已配置且可用的提供方，因为本包自身不发起网络请求。
 
 ## 目录
 
@@ -29,7 +29,7 @@ kind: "package-reference"
 
 ### 何时选择
 
-当插件或工具必须搜索或抓取、又不希望硬编码厂商时选择本服务；只使用已交付的 `web_search`／`web_fetch` 工具的组合会通过 `dsh-tool-web` 免费获得它。当组合从不访问 web 时，你不需要它。服务本身不增加任何网络访问能力：没有至少一个可用提供方时，每次调用都会以结构化 `WebError` 失败。
+当插件或工具必须搜索或抓取、又不希望硬编码厂商时选择本服务；只使用已交付的 `web_search`／`web_fetch` 工具的组合会通过 `dsh-tool-web` 自动加载本服务。当组合从不访问 web 时，你不需要它。服务本身不增加任何网络访问能力：没有至少一个可用提供方时，每次调用都会以结构化 `WebError` 失败。
 
 ### 最小配置
 
@@ -77,6 +77,17 @@ const page = await ctx.web.fetch({ url: 'https://example.com' })
 
 提供方的可用性是一项廉价的局部检查——例如其 API 密钥是否存在——并且从不发起网络调用，因此选择保持快速且确定。
 
+<a id="search-readiness"></a>
+### 搜索与抓取就绪
+
+`searchReady(llmProvider?)` 与 `fetchReady(llmProvider?)` 询问 `search()` 或 `fetch()` 会选中的提供方：为该对话路由上的模型请求发起的操作是否有可发送的凭据；[`dsh-tool-web`](../tool-web/README.zh.md#search-readiness) 据此决定每个模型步骤是否准入 `web_search` 与 `web_fetch`。提供方通过可选的 `ready(llmProvider)` 回答，它是只检查配置的判断，禁止发起网络调用；未实现它的提供方视为就绪。选择失败时就绪方法回答 true，因为对应操作会把该失败报告为结构化 `WebError`。就绪判断从不改变选中哪个提供方。
+
+```text
+// false only when the selected provider cannot authenticate this route's operations:
+const searchOffered = await ctx.web.searchReady('deepseek-official')
+const fetchOffered = await ctx.web.fetchReady('deepseek-official')
+```
+
 ### 失败与恢复
 
 失败抛出 `WebError`，携带稳定、可按机器路由的 code；消息补充细节，例如缺失的提供方 id 或歧义候选集合。调用方按 code 路由并决定如何降级。要改变一次调用使用的后端，请重新配置固定的 id、挂载或卸载提供方，或修正提供方配置使其可用性检查通过。
@@ -103,17 +114,16 @@ const page = await ctx.web.fetch({ url: 'https://example.com' })
 
 | 文件 | 职责 |
 |---|---|
-| [`src/index.ts`](src/index.ts) | 插件入口：`WebRuntime` 服务、两个提供方注册表与执行时选择 |
+| [`src/index.ts`](src/index.ts) | 插件入口：`WebRuntime` 服务、两个提供方注册表、执行时选择与按路由的就绪判断 |
 | [`src/types.ts`](src/types.ts) | 词汇：请求／结果类型、封闭的 `WebFetchBody` 联合与 `WebError` 分类体系 |
-| — | 不发布运行时不变式伴生入口；约定在服务处强制执行。 |
 
 ### 数据模型
 
-请求与结果类型定义了调用方赖以构建的规范化词汇——一组 `Search` 对与一组 `Fetch` 对——穷尽式字段与 JSDoc 见 [`src/types.ts`](src/types.ts) 与 [web 子系统](../../../docs/subsystems/web.zh.md) 参考。两个刻意的选择塑造了它们：`WebFetchBody` 是这里拥有的封闭联合（`html` | `text`），因此新增类型会破坏编译，直到每个消费方都处理它；`WebError` 继承 `HarnessError`，携带开放的字符串 `code`，因此消费方必须容忍提供方专有的取值。来源字段保持可选，因为并非每个提供方都返回全部字段。
+请求与结果类型定义了调用方赖以构建的规范化词汇——`Search` 请求／结果对与 `Fetch` 请求／结果对各一组——穷尽式字段与 JSDoc 见 [`src/types.ts`](src/types.ts) 与 [web 子系统](../../../docs/subsystems/web.zh.md) 参考。两个刻意的选择塑造了它们：`WebFetchBody` 是这里拥有的封闭联合（`html` | `text`），因此新增类型会破坏编译，直到每个消费方都处理它；`WebError` 继承 `HarnessError`，携带开放的字符串 `code`，因此消费方必须容忍提供方专有的取值。来源字段保持可选，因为并非每个提供方都返回全部字段。
 
 ### 选择流程
 
-执行时，服务先按配置 id、再按唯一可用提供方解析提供方，没有明确赢家时抛出对应的 `WebError`。搜索结果随后经过 `capSources`：把 `sources[]` 截断到 `maxResults` 并标记 `truncated`。注册基于 effect：提供方随调用 fiber 注册，fiber 释放时注销；同一能力类型下重复的 id 会在注册时被拒绝。
+执行时，服务先按配置 id、再按唯一可用提供方解析提供方，没有明确赢家时抛出对应的 `WebError`。搜索结果随后经过 `capSources`：把 `sources[]` 截断到 `maxResults` 并标记 `truncated`。`searchReady()` 与 `fetchReady()` 解析与对应操作相同的提供方，解析抛错时回答 true，否则返回该提供方 `ready()` 的回答，提供方没有 `ready()` 时回答 true。注册基于 effect：提供方随调用 fiber 注册，fiber 释放时注销；同一能力类型下重复的 id 会在注册时被拒绝。
 
 </details>
 
@@ -130,13 +140,14 @@ const page = await ctx.web.fetch({ url: 'https://example.com' })
 - [dsh-web-fetch-http](../web-fetch-http/README.zh.md)——已交付的匿名 HTTP(S) 抓取后端。
 - [生成配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-web)——每个受支持配置字段及其源声明。
 - [web 能力 seam 决策](../../../.agents/notes/implemented/architecture/2026-06-24-web-capability-seam.zh.md)——搜索与抓取为何共用一项提供方选择服务。
+- [搜索就绪决策](../../../.agents/notes/implemented/architecture/2026-09-27-web-search-offered-by-provider-readiness.zh.md)——seam 为何为 `dsh-tool-web` 按路由回答搜索与抓取就绪。
 
 -----
 
 <a id="model-experience"></a>
 ## 模型体验
 
-间接地，通过 `dsh-tool-web`：该工具把 seam 规范化的搜索结果与抓取正文渲染给模型，而本服务不贡献任何提示词或 schema。
+间接地，通过 `dsh-tool-web`：该工具把 seam 规范化的搜索结果与抓取正文渲染给模型，并且不让 `searchReady()` 或 `fetchReady()` 回答 false 的模型步骤准入 `web_search` 或 `web_fetch`，而本服务不贡献任何提示词或 schema。
 
 #### KV Cache 影响
 
@@ -149,7 +160,7 @@ const page = await ctx.web.fetch({ url: 'https://example.com' })
 
 这些限制说明本服务单独使用时在哪些方面不完整。它们是当前包约束。
 
-- **没有观测接口**：没有提供方变更事件或能力状态查询；可用性只能通过执行搜索或抓取并按抛出的 code 路由来观测，无提供方失败是通用的 `WEB_PROVIDER_UNAVAILABLE`，不枚举逐提供方原因（见 [Agent Note](../../../.agents/notes/archived/simplification/2026-07-04-drop-unconsumed-web-observation-surface.md)）。
+- **没有观测接口**：没有提供方变更事件或能力状态查询；`searchReady()` 与 `fetchReady()` 只报告选中提供方的凭据就绪状态，选择失败时回答 true。可用性只能通过执行搜索或抓取并按抛出的 code 路由来观测，无提供方失败是通用的 `WEB_PROVIDER_UNAVAILABLE`，不枚举逐提供方原因（见 [Agent Note](../../../.agents/notes/archived/simplification/2026-07-04-drop-unconsumed-web-observation-surface.md)）。
 - **搜索请求只携带 `query` 与 `maxResults`**：提供方无关的控制项（新近程度、域名过滤条件、区域提示、搜索深度）暂缓至后端都能诚实支持时（见 [seam Agent Note](../../../.agents/notes/implemented/architecture/2026-06-24-web-capability-seam.zh.md)）。
 - **`WebFetchBody` 没有 `pdf` 分支**：可提取文本的 PDF 支持属于明确的延期工作；封闭联合会使新增该分支成为跨 web 包、由编译强制执行的变更。
 - **提供方支持的页面提取不属于 `fetch()` 范围**：Firecrawl/Tavily 风格的 `web_extract` 能力延期，而不会扩展抓取操作。

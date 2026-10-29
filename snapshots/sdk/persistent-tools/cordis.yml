@@ -2,8 +2,14 @@
 # editor as model-facing tools, with process-local providers and an explicit
 # danger-full-access / never-ask policy.
 
+- insert:
+    - id: tool-str-replace-editor
+      name: '@deepseek-ai/dsh-tool-str-replace-editor'
+      config:
+        maxOutputChars: 16000
+
 - id: llm-deepseek
-  name: '@deepseek-ai/dsh-llm-deepseek'
+  name: '@deepseek-ai/dsh-llm-deepseek-api-key'
   config:
     apiKeyEnv: DEEPSEEK_API_KEY
     streamIdleTimeoutMs: 172800000
@@ -78,10 +84,6 @@
   name: '@deepseek-ai/dsh-tool-subagent-control'
   disabled: true
 
-- id: tool-subagent-list-agents
-  name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
-  disabled: true
-
 - id: tool-subagent
   name: '@deepseek-ai/dsh-tool-subagent'
   disabled: true
@@ -102,10 +104,6 @@
   name: '@deepseek-ai/dsh-tool-goal'
   disabled: true
 
-- id: tool-ralph
-  name: '@deepseek-ai/dsh-tool-ralph'
-  disabled: true
-
 - id: tool-web
   name: '@deepseek-ai/dsh-tool-web'
   disabled: true
@@ -118,7 +116,7 @@
   name: '@deepseek-ai/dsh-system-prompt'
   config:
     includeHarnessIdentity: false
-    persona: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a helpful software engineer assistant.'
+    personaPrefix: !!js process.env.DSH_SYSTEM_PROMPT ?? 'You are a helpful software engineer assistant.'
 
 - id: session-persistence-jsonl
   name: '@deepseek-ai/dsh-session-persistence-jsonl'
@@ -156,3 +154,7 @@
           * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
           * Please avoid commands that may produce a very large amount of output.
           * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+
+- id: session-log-deepseek
+  config:
+    enabled: false

@@ -2,12 +2,13 @@
  * Doc-sync gate for the canonical package-README limitations section. It scans
  * package manifests, rejects missing or variant sections, and requires one
  * top-level bullet; audited packages in {@link NO_LIMITATIONS} must omit it.
- * See the [limitations Agent Note](../.agents/notes/implemented/process/2026-07-10-readme-known-limitations-gate.md).
+ * The archived [limitations gate record](../.agents/notes/archived/process/2026-07-10-readme-known-limitations-gate.md)
+ * documents the original decision.
  */
 
 import { existsSync, globSync, readFileSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
-import { markdownHeadingLines, markdownProseLines } from './markdown.ts'
+import { markdownHeadingLines, markdownProseLines, parseMarkdown } from './markdown.ts'
 
 const root = resolve(import.meta.dirname, '..')
 
@@ -50,8 +51,9 @@ for (const pkg of scannedPackages) {
     continue
   }
   const source = readFileSync(resolve(root, readme), 'utf8')
-  const lines = markdownProseLines(source)
-  const headings = markdownHeadingLines(source)
+  const tree = parseMarkdown(source)
+  const lines = markdownProseLines(source, tree)
+  const headings = markdownHeadingLines(source, tree)
   const limitations = headings.filter(heading => isLimitationsLike(heading.text))
 
   if (Object.hasOwn(NO_LIMITATIONS, pkg)) {

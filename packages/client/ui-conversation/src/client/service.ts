@@ -16,13 +16,19 @@ import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
 import type {
   ISessions, PendingSubmissionRetirement, SessionFace,
 } from '@deepseek-ai/dsh-api-session-controller/client'
+import type {} from '@deepseek-ai/dsh-client-file-upload/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import type { ComposerAttachment } from './contract/slots.ts'
-import type { QueueAction, QueueItemId } from './contract/queue.ts'
+import type { FileAttachmentRef, ImageMediaType } from '@deepseek-ai/dsh-attachment'
+import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
+import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
+import type {
+  ComposerAttachment, ComposerFileAttachment, ComposerImageAttachment, DraftFileUpload,
+} from './contract/slots.ts'
+import type { QueueAction } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { ComposerBlocks } from './contract/composer-blocks.ts'
 import type {
-  DraftAttachmentId, SessionInputResolver, SubmitImageAttachment, SubmitOutcome,
+  DraftAttachmentId, DraftAttachmentSerializationResult, SessionInputResolver, SubmitAttachment, SubmitOutcome,
 } from './contract/input.ts'
 import type { InputSubmitMode } from './contract/composer-submission.ts'
 
@@ -46,12 +52,12 @@ export interface IConversation {
    */
   send(text: string): Promise<void>
   /**
-   * Apply one edit, remove, or strict steer operation to a pending queue occurrence.
+   * Apply one edit, remove, or Steer operation to a pending queue occurrence.
    * @param itemId - agent-owned inbox occurrence identity.
    * @param action - requested queue operation.
-   * @returns completion; converged strict-steer races resolve, while other failures reject.
+   * @returns completion; converged QueueDock races resolve, while other failures reject.
    */
-  updateQueue(itemId: QueueItemId, action: QueueAction): Promise<void>
+  updateQueue(itemId: MessageId, action: QueueAction): Promise<void>
   /**
    * Cancel the scoped session's in-flight turn while preserving its pending Queue.
    * @returns completion; failures reject as in send.
@@ -64,8 +70,8 @@ export interface IConversation {
   loadOlder(): Promise<void>
 }
 
-/** Create one browser-only draft descriptor; only its id enters input state. */
-function browserDraftAttachment(file: File): ComposerAttachment {
+/** Create one browser-only image draft descriptor; only its id enters input state. */
+function browserDraftAttachment(file: File): ComposerImageAttachment {
   return {
     kind: 'image',
     id: randomUUID() as DraftAttachmentId,
@@ -82,7 +88,7 @@ function browserDraftAttachment(file: File): ComposerAttachment {
  * reads the dimensions into an immutable echo snapshot, so this late write
  * does not require a store notification.
  */
-function probeDimensions(attachment: ComposerAttachment): void {
+function probeDimensions(attachment: ComposerImageAttachment): void {
   if (typeof Image !== 'function') return
   const probe = new Image()
   probe.onload = () => {
@@ -115,8 +121,8 @@ function nextPaint(): Promise<void> {
   })
 }
 
-/** Native canonical base64 of one browser file (FileReader data-URL encode; no main-thread byte loop). */
-function base64Of(file: File): Promise<string> {
+/** Native canonical base64 of one browser image (FileReader data-URL encode; no main-thread byte loop). */
+function base64ImageOf(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => {
@@ -149,7 +155,20 @@ export class ConversationController extends Service implements IConversation {
   readonly input: SessionInputResolver
   /** The per-session composer-block registry. */
   readonly blocks: ComposerBlocks
+  /** Live upload state per draft that uploads when added: every file draft and every uploaded image draft. */
+  readonly fileUploads: SnapshotStore<Record<string, DraftFileUpload>> = createSnapshotStore<Record<string, DraftFileUpload>>({})
   private readonly draftAttachments = new Map<DraftAttachmentId, ComposerAttachment>()
+  private readonly fileUploadOperations = new Map<DraftAttachmentId, {
+    readonly controller: AbortController
+    readonly done: Promise<void>
+  }>()
+  private readonly pendingFileUploads = new Set<Promise<void>>()
+  private readonly fileUploadQueue: Array<{
+    readonly run: () => Promise<void>
+    readonly settle: () => void
+  }> = []
+  private activeFileUploads = 0
+  private readonly maxConcurrentFileUploads: number
 
   /**
    * @param ctx - owning root context (the plugin apply context; the service
@@ -158,15 +177,26 @@ export class ConversationController extends Service implements IConversation {
    * constructed by the plugin apply (the same instances the slot inject
    * factories close over).
    */
-  constructor(ctx: Context, config: { input: SessionInputResolver; blocks: ComposerBlocks }) {
+  constructor(ctx: Context, config: {
+    input: SessionInputResolver
+    blocks: ComposerBlocks
+    maxConcurrentFileUploads: number
+  }) {
     super(ctx, 'conversation')
     this.input = config.input
     this.blocks = config.blocks
-    ctx.effect(() => () => {
+    this.maxConcurrentFileUploads = config.maxConcurrentFileUploads
+    ctx.effect(() => async () => {
+      const operations = [...this.fileUploadOperations.values()]
+      for (const operation of operations) operation.controller.abort()
+      await Promise.allSettled([...this.pendingFileUploads])
+      this.fileUploadOperations.clear()
+      this.fileUploadQueue.length = 0
       for (const attachment of this.draftAttachments.values()) {
-        revokePreview(attachment.previewUrl)
+        if (attachment.kind === 'image') revokePreview(attachment.previewUrl)
       }
       this.draftAttachments.clear()
+      this.fileUploads.set({})
     }, 'conversation draft attachments')
   }
 
@@ -183,91 +213,253 @@ export class ConversationController extends Service implements IConversation {
   }
 
   /**
-   * Submit ordered draft images with text through one host admission. A local
-   * submission echo enters the session snapshot synchronously; serialization
-   * and the prompt round-trip start after the browser can paint it. On the
-   * echo's observed retirement the draft images hand their preview URLs to
-   * the durable image cache and leave the registry; on failure they stay
-   * registered so the composer can restore them.
+   * Submit ordered draft attachments with text through one host admission. A
+   * local submission echo is registered first and enters the session snapshot
+   * once the Host accepts the prompt; serialization and the prompt round-trip
+   * start after the browser can paint the composer's sending state. The
+   * outcome is success as soon as the Host accepts the prompt, which an Inbox
+   * row carrying the request id can show before the receipt. The echo's
+   * observed retirement seeds admitted image previews into the durable cache
+   * and removes every attachment from the draft registry; an accepted prompt
+   * whose echo retires unobserved also releases them. Until the Host accepts
+   * the prompt, every attachment remains registered for the composer.
    * @param session - target session.
    * @param text - serialized prompt text.
-   * @param imageIds - ordered draft-local attachment ids.
+   * @param attachmentIds - ordered draft-local attachment ids.
    * @param mode - queue or steer delivery selected by composer policy.
    * @param signal - optional cancellation for the complete Host admission.
+   * @param accept - called inside the Session's acceptance, before the echo renders, so the composer settles with it.
    * @returns the Host admission outcome; local attachment preparation failures reject.
    */
   async sendSession(
     session: SessionFace,
     text: string,
-    imageIds: readonly DraftAttachmentId[],
+    attachmentIds: readonly DraftAttachmentId[],
     mode: InputSubmitMode,
     signal?: AbortSignal,
+    accept?: () => void,
   ): Promise<SubmitOutcome> {
-    const attachments = this.draftImages(imageIds)
-    if (attachments.length !== imageIds.length) {
-      throw new Error('conversation.sendSession: one or more draft images are no longer available')
+    const attachments = this.resolveDraftAttachments(attachmentIds)
+    if (attachments.length !== attachmentIds.length) {
+      throw new Error('conversation.sendSession: one or more draft attachments are no longer available')
     }
-    const snapshot = session.getSnapshot()
-    if (snapshot.subagent !== null) {
-      const uploaded = await this.serializeImages(attachments.map(attachment => attachment.file))
-      const content = [...uploaded, ...(text === '' ? [] : [{ type: 'text' as const, text }])]
-      const result = await session.prompt(content, mode, signal)
-      return result.ok ? { kind: 'success' } : { kind: 'error' }
+    const uploads = this.fileUploads.getSnapshot()
+    const uploadFor = (attachment: ComposerAttachment): Extract<DraftFileUpload, { status: 'ready' }> => {
+      const upload = uploads[attachment.id]
+      if (upload === undefined || upload.status !== 'ready') {
+        throw new Error('conversation.sendSession: one or more files have not finished uploading')
+      }
+      return upload
     }
-    let finishRetirement: ((retirement: PendingSubmissionRetirement) => void) | undefined
-    const retirement = attachments.length === 0
-      ? undefined
-      : new Promise<PendingSubmissionRetirement>((resolve) => { finishRetirement = resolve })
+    // A file draft's upload always stores a file; only image drafts store an image.
+    const storedFileOf = (attachment: ComposerFileAttachment): FileAttachmentRef =>
+      (uploadFor(attachment) as Extract<DraftFileUpload, { readonly file: FileAttachmentRef }>).file
+    // An image draft without an upload, such as a subagent continuation's, sends its bytes inline.
+    const imageReceipts = new Map(attachments.flatMap(attachment => attachment.kind === 'image'
+      && uploads[attachment.id] !== undefined ? [[attachment.id, uploadFor(attachment).receiptId] as const] : []))
+    const pendingAttachments = attachments.map(attachment => attachment.kind === 'image'
+      ? {
+        type: 'image' as const,
+        value: {
+          previewUrl: attachment.previewUrl,
+          ...(attachment.file.name === '' ? {} : { name: attachment.file.name }),
+          ...(attachment.width === undefined ? {} : { width: attachment.width }),
+          ...(attachment.height === undefined ? {} : { height: attachment.height }),
+        },
+      }
+      : { type: 'file' as const, value: storedFileOf(attachment) })
+    const serializeAttachments = (): Promise<Parameters<SessionFace['prompt']>[0]> => Promise.all(
+      attachments.map(async (attachment) => {
+        if (attachment.kind === 'file') return { type: 'file' as const, receiptId: uploadFor(attachment).receiptId }
+        const receiptId = imageReceipts.get(attachment.id)
+        return receiptId === undefined
+          ? { type: 'image' as const, ...await this.encodeImage(attachment.file) }
+          : { type: 'file' as const, receiptId }
+      }),
+    )
+    // The composer owns the attachments until the Host accepts the prompt.
+    const ownership = { accepted: false, retiredUnobserved: false }
+    const acceptance = Promise.withResolvers<undefined>()
     const submission = session.beginSubmission({
       mode,
       text,
-      images: attachments.map(attachment => ({
-        previewUrl: attachment.previewUrl,
-        ...(attachment.file.name === '' ? {} : { name: attachment.file.name }),
-        ...(attachment.width === undefined ? {} : { width: attachment.width }),
-        ...(attachment.height === undefined ? {} : { height: attachment.height }),
-      })),
+      attachments: pendingAttachments,
+      onAccept: () => {
+        ownership.accepted = true
+        accept?.()
+        acceptance.resolve(undefined)
+      },
       onRetire: (settlement) => {
-        this.settleSubmittedImages(session.sessionId, attachments, settlement)
-        finishRetirement?.(settlement)
+        if (settlement.reason === 'observed') this.settleSubmittedAttachments(session.sessionId, attachments, settlement)
+        else if (ownership.accepted) this.releaseDraftAttachments(attachments)
+        else ownership.retiredUnobserved = true
       },
     })
     let content: Parameters<SessionFace['prompt']>[0]
     try {
       await nextPaint()
-      const uploaded = await this.serializeImages(attachments.map(attachment => attachment.file))
+      const uploaded = await serializeAttachments()
       content = [...uploaded, ...(text === '' ? [] : [{ type: 'text' as const, text }])]
     } catch (error) {
       submission.abandon()
       throw error
     }
-    const result = await session.prompt(content, mode, signal, submission.requestId)
-    if (!result.ok) return { kind: 'error' }
-    if (retirement !== undefined && (await retirement).reason !== 'observed') return { kind: 'error' }
+    // An Inbox row can show the acceptance before the receipt; a receipt that fails afterwards changes
+    // nothing here because the Host already holds the message.
+    const result = await Promise.race([session.prompt(content, mode, signal, submission.requestId), acceptance.promise])
+    if (result !== undefined && !result.ok) return { kind: 'error' }
+    ownership.accepted = true
+    // An accepted prompt whose echo already retired unobserved, as when its queue entry was removed.
+    if (ownership.retiredUnobserved) this.releaseDraftAttachments(attachments)
     return { kind: 'success' }
   }
 
   /**
-   * Create runtime-only draft images and their object URLs.
-   * @param files - browser files to register after MIME validation.
+   * Create runtime-only draft attachments. Files whose browser MIME is an
+   * accepted image type become image drafts with an object URL preview; every
+   * other file becomes a file draft. A file draft's background upload starts
+   * immediately, and so does an image draft's when `uploadImages` is set; the
+   * upload remains owned by this service across Session navigation until
+   * completion or explicit removal. An image draft without an upload sends its
+   * bytes with the prompt.
+   * @param sessionId - target Agent-scope identity.
+   * @param files - browser files to register.
+   * @param uploadImages - whether the Session accepts image uploads; a subagent continuation does not.
    * @returns ordered draft descriptors.
    */
-  createDraftImages(files: readonly File[]): readonly ComposerAttachment[] {
-    for (const file of files) imageMediaType(file.type)
+  createDrafts(sessionId: SessionId, files: readonly File[], uploadImages: boolean): readonly ComposerAttachment[] {
     return files.map((file) => {
-      const attachment = browserDraftAttachment(file)
+      if (isImageMediaType(file.type)) {
+        const attachment = browserDraftAttachment(file)
+        this.draftAttachments.set(attachment.id, attachment)
+        probeDimensions(attachment)
+        if (uploadImages) this.beginFileUpload(sessionId, attachment)
+        return attachment
+      }
+      const attachment: ComposerFileAttachment = {
+        kind: 'file',
+        id: randomUUID() as DraftAttachmentId,
+        file,
+      }
       this.draftAttachments.set(attachment.id, attachment)
-      probeDimensions(attachment)
+      this.beginFileUpload(sessionId, attachment)
       return attachment
     })
   }
 
   /**
-   * Resolve ordered input-state ids to runtime-owned draft images.
+   * Restart one failed file or image upload.
+   * @param sessionId - target Agent-scope identity.
+   * @param id - draft attachment id whose upload previously failed.
+   */
+  retryFileUpload(sessionId: SessionId, id: DraftAttachmentId): void {
+    const attachment = this.draftAttachments.get(id)
+    if (attachment === undefined) return
+    if (this.fileUploads.getSnapshot()[id]?.status !== 'error') return
+    this.beginFileUpload(sessionId, attachment)
+  }
+
+  /**
+   * Stage carried file and image drafts again for a new Session.
+   * @param sessionId - target Agent-scope identity after a Workspace switch.
+   * @param ids - carried draft attachment ids.
+   * @param uploadImages - whether the target Session stages image uploads; an image draft otherwise sends inline.
+   */
+  rebindDraftFiles(sessionId: SessionId, ids: readonly DraftAttachmentId[], uploadImages: boolean): void {
+    for (const id of ids) {
+      const attachment = this.draftAttachments.get(id)
+      if (attachment === undefined) continue
+      if (attachment.kind === 'image' && !uploadImages) this.dropUpload(id)
+      else this.beginFileUpload(sessionId, attachment)
+    }
+  }
+
+  private beginFileUpload(sessionId: SessionId, attachment: ComposerAttachment): void {
+    this.fileUploadOperations.get(attachment.id)?.controller.abort()
+    const controller = new AbortController()
+    this.fileUploads.update((draft) => {
+      draft[attachment.id] = { status: 'uploading', loaded: 0 }
+    })
+    let settle!: () => void
+    const done = new Promise<void>((resolve) => { settle = resolve })
+    this.fileUploadOperations.set(attachment.id, { controller, done })
+    this.pendingFileUploads.add(done)
+    void done.then(() => { this.pendingFileUploads.delete(done) })
+    const name = attachment.file.name === '' ? undefined : attachment.file.name
+    const onProgress = (progress: { readonly loaded: number; readonly total?: number }): void => {
+      if (this.fileUploadOperations.get(attachment.id)?.controller !== controller) return
+      this.fileUploads.update((draft) => {
+        if (!(attachment.id in draft)) return
+        draft[attachment.id] = {
+          status: 'uploading',
+          loaded: progress.loaded,
+          ...(progress.total === undefined ? {} : { total: progress.total }),
+        }
+      })
+    }
+    const run = async (): Promise<void> => {
+      try {
+        if (controller.signal.aborted
+          || this.fileUploadOperations.get(attachment.id)?.controller !== controller) return
+        const result = attachment.kind === 'image'
+          ? await this.ctx.fileUpload.uploadImage(
+            sessionId, attachment.file, imageMediaType(attachment.file.type), name, controller.signal, onProgress,
+          )
+          : await this.ctx.fileUpload.upload(sessionId, attachment.file, name, controller.signal, onProgress)
+        if (this.fileUploadOperations.get(attachment.id)?.controller !== controller) return
+        this.fileUploads.update((draft) => {
+          if (!(attachment.id in draft)) return
+          if (result.ok) {
+            draft[attachment.id] = 'file' in result.value
+              ? { status: 'ready', receiptId: result.value.receiptId, file: result.value.file }
+              : { status: 'ready', receiptId: result.value.receiptId }
+            return
+          }
+          const { error } = result
+          // A Host refusal keeps its reason: retrying the same bytes cannot succeed.
+          draft[attachment.id] = error.code === 'session/attachment-invalid' || error.code === 'subagent/attachment-invalid'
+            ? { status: 'error', message: error.message, reason: error.details.reason }
+            : { status: 'error', message: error.message }
+        })
+      } catch (error) {
+        if (this.fileUploadOperations.get(attachment.id)?.controller !== controller) return
+        this.fileUploads.update((draft) => {
+          if (!(attachment.id in draft)) return
+          draft[attachment.id] = {
+            status: 'error',
+            message: error instanceof Error ? error.message : String(error),
+          }
+        })
+      } finally {
+        if (this.fileUploadOperations.get(attachment.id)?.controller === controller) {
+          this.fileUploadOperations.delete(attachment.id)
+        }
+      }
+    }
+    this.fileUploadQueue.push({ run, settle })
+    this.pumpFileUploads()
+  }
+
+  /** Start queued upload Workers until the configured concurrency is occupied. */
+  private pumpFileUploads(): void {
+    while (this.activeFileUploads < this.maxConcurrentFileUploads) {
+      const task = this.fileUploadQueue.shift()
+      if (task === undefined) return
+      this.activeFileUploads += 1
+      void task.run().finally(() => {
+        this.activeFileUploads -= 1
+        task.settle()
+        this.pumpFileUploads()
+      })
+    }
+  }
+
+  /**
+   * Resolve ordered input-state ids to runtime-owned draft attachments.
    * @param ids - draft attachment ids.
    * @returns descriptors that remain live, in requested order.
    */
-  draftImages(ids: readonly DraftAttachmentId[]): readonly ComposerAttachment[] {
+  resolveDraftAttachments(ids: readonly DraftAttachmentId[]): readonly ComposerAttachment[] {
     const attachments: ComposerAttachment[] = []
     for (const id of ids) {
       const attachment = this.draftAttachments.get(id)
@@ -277,41 +469,71 @@ export class ConversationController extends Service implements IConversation {
   }
 
   /**
-   * Serialize ordered draft images to command-submit wire payloads without
-   * sending or releasing them (the composer releases only after the command
-   * settles successfully).
-   * @param imageIds - ordered draft-local attachment ids.
-   * @returns base64 payloads in id order.
+   * Serialize ordered draft attachments to command-submit wire payloads without
+   * sending or releasing them. Images are encoded even when an upload already
+   * stored them, because commands accept only file receipts; generic files cite
+   * receipts from their completed background uploads and never reread browser bytes.
+   * @param attachmentIds - ordered draft-local attachment ids.
+   * @returns wire payloads in id order.
    */
-  async serializeDraftImages(imageIds: readonly DraftAttachmentId[]): Promise<readonly SubmitImageAttachment[]> {
-    const attachments = this.draftImages(imageIds)
-    if (attachments.length !== imageIds.length) {
-      throw new Error('conversation.serializeDraftImages: one or more draft images are no longer available')
+  async serializeDraftAttachments(
+    attachmentIds: readonly DraftAttachmentId[],
+  ): Promise<DraftAttachmentSerializationResult> {
+    const attachments = this.resolveDraftAttachments(attachmentIds)
+    if (attachments.length !== attachmentIds.length) {
+      throw new Error('conversation.serializeDraftAttachments: one or more draft attachments are no longer available')
     }
-    return Promise.all(attachments.map(attachment => this.encodeImage(attachment.file)))
+    const uploads = this.fileUploads.getSnapshot()
+    return {
+      attachments: await Promise.all(attachments.map(async (attachment) => {
+        if (attachment.kind === 'image') return { type: 'image' as const, ...await this.encodeImage(attachment.file) }
+        const upload = uploads[attachment.id]
+        if (upload === undefined || upload.status !== 'ready') {
+          throw new Error('conversation.serializeDraftAttachments: one or more files have not finished uploading')
+        }
+        return { type: 'file' as const, receiptId: upload.receiptId }
+      })),
+    }
   }
 
   /**
-   * Release one browser-owned draft image and preview URL.
+   * Release one browser-owned draft attachment, aborting its active upload.
    * @param id - draft attachment id.
    */
-  releaseDraftImage(id: DraftAttachmentId): void {
+  releaseDraftAttachment(id: DraftAttachmentId): void {
     const attachment = this.draftAttachments.get(id)
     if (attachment === undefined) return
     this.draftAttachments.delete(id)
-    revokePreview(attachment.previewUrl)
+    if (attachment.kind === 'image') revokePreview(attachment.previewUrl)
+    // The stored Host object stays durable; only the draft's upload state ends.
+    this.dropUpload(id)
+  }
+
+  /** Abort one draft's active upload and drop its upload state. */
+  private dropUpload(id: DraftAttachmentId): void {
+    const operation = this.fileUploadOperations.get(id)
+    this.fileUploadOperations.delete(id)
+    operation?.controller.abort()
+    this.forgetUpload(id)
+  }
+
+  /** Drop one draft's upload state. */
+  private forgetUpload(id: DraftAttachmentId): void {
+    const uploads = this.fileUploads.getSnapshot()
+    if (!(id in uploads)) return
+    this.fileUploads.set(Object.fromEntries(Object.entries(uploads).filter(([key]) => key !== id)))
   }
 
   /**
-   * Release a set of browser-owned draft images.
+   * Release a set of browser-owned draft attachments.
    * @param attachments - descriptors to release.
    */
-  releaseDraftImages(attachments: readonly ComposerAttachment[]): void {
-    for (const attachment of attachments) this.releaseDraftImage(attachment.id)
+  releaseDraftAttachments(attachments: readonly ComposerAttachment[]): void {
+    for (const attachment of attachments) this.releaseDraftAttachment(attachment.id)
   }
 
   /** Apply one operation to a pending queue occurrence. */
-  async updateQueue(itemId: QueueItemId, action: QueueAction): Promise<void> {
+  async updateQueue(itemId: MessageId, action: QueueAction): Promise<void> {
     const session = this.scopedSession('updateQueue')
     const result = await session.updateQueue(itemId, action)
     if (!result.ok) {
@@ -361,40 +583,40 @@ export class ConversationController extends Service implements IConversation {
   }
 
   /**
-   * Settle one submission's draft images when its echo retires. Observed:
-   * each image leaves the registry, handing its preview URL to the durable
-   * image cache (seeded under the admitted reference so the transcript node
-   * renders immediately while the cache reads canonical bytes) or revoking it
-   * when the cache already holds that reference. Failed: nothing changes;
-   * the ids stay registered for the composer's rail restore.
+   * Settle one submission's draft attachments when its echo is observed: each
+   * file is released, and each image leaves the registry, handing its preview
+   * URL to the durable image cache (seeded under the admitted reference so the
+   * transcript node renders immediately while the cache reads canonical
+   * bytes) or revoking it when the cache already holds that reference.
    */
-  private settleSubmittedImages(
+  private settleSubmittedAttachments(
     sessionId: SessionId,
     attachments: readonly ComposerAttachment[],
-    retirement: PendingSubmissionRetirement,
+    retirement: Extract<PendingSubmissionRetirement, { readonly reason: 'observed' }>,
   ): void {
-    if (retirement.reason !== 'observed') return
     const uiConversation = this.ctx.get('uiConversation')
-    attachments.forEach((attachment, index) => {
+    let observedIndex = 0
+    for (const attachment of attachments) {
       const live = this.draftAttachments.get(attachment.id)
-      if (live === undefined) return
+      const ref = retirement.attachments[observedIndex++]
+      if (live === undefined) continue
+      if (attachment.kind === 'file') {
+        this.releaseDraftAttachment(attachment.id)
+        continue
+      }
       this.draftAttachments.delete(attachment.id)
-      const ref = retirement.attachments[index]
-      if (ref !== undefined && uiConversation?.seedImageUrl(sessionId, ref, attachment.previewUrl) === true) return
+      this.forgetUpload(attachment.id)
+      if (ref !== undefined && 'mediaType' in ref
+        && uiConversation?.seedImageUrl(sessionId, ref, attachment.previewUrl) === true) continue
       revokePreview(attachment.previewUrl)
-    })
-  }
-
-  /** Convert browser files to canonical base64 prompt parts. */
-  private serializeImages(images: readonly File[]): Promise<Parameters<SessionFace['prompt']>[0]> {
-    return Promise.all(images.map(async file => ({ type: 'image' as const, ...await this.encodeImage(file) })))
+    }
   }
 
   /** Canonical base64 wire form of one browser image file. */
-  private async encodeImage(file: File): Promise<SubmitImageAttachment> {
+  private async encodeImage(file: File): Promise<Omit<Extract<SubmitAttachment, { type: 'image' }>, 'type'>> {
     return {
       mediaType: imageMediaType(file.type),
-      data: await base64Of(file),
+      data: await base64ImageOf(file),
       ...(file.name === '' ? {} : { name: file.name }),
     }
   }
@@ -410,6 +632,15 @@ function imageMediaType(value: string): ImageMediaType {
     default:
       throw new UnsupportedImageMediaTypeError(value)
   }
+}
+
+/**
+ * Whether a browser-declared MIME selects the image draft path (all other files upload verbatim).
+ * @param value - the browser's declared MIME type.
+ * @returns whether the file is an accepted raster image.
+ */
+export function isImageMediaType(value: string): boolean {
+  return value === 'image/png' || value === 'image/jpeg' || value === 'image/webp' || value === 'image/gif'
 }
 
 function revokePreview(url: string): void {

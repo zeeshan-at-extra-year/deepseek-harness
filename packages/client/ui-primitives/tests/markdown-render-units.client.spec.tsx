@@ -22,6 +22,8 @@ function makeContext(): MarkdownRenderContext {
     streaming: false,
     labels: markdownLabels,
     fileMentions: undefined,
+    pathImages: undefined,
+    omitHtml: false,
     targets: createReferenceTargets(),
     footnoteOrder: [],
     footnoteCounts: new Map(),

@@ -21,11 +21,11 @@ import LocalAttachmentStore, {
 describe('local attachment service', () => {
   it('resolves every omitted admission limit explicitly', () => {
     const service = new LocalAttachmentStore(new Context(), {})
-    expect(DEFAULT_MAX_IMAGE_BYTES).toBe(20 * 1024 * 1024)
+    expect(DEFAULT_MAX_IMAGE_BYTES).toBe(50 * 1024 * 1024)
     expect(DEFAULT_MAX_IMAGES_PER_MESSAGE).toBe(20)
     expect(DEFAULT_MAX_MESSAGE_IMAGE_BYTES).toBe(200 * 1024 * 1024)
     expect(DEFAULT_MAX_IMAGE_PIXELS).toBe(64_000_000)
-    expect(DEFAULT_MAX_IMAGE_DIMENSION).toBe(8192)
+    expect(DEFAULT_MAX_IMAGE_DIMENSION).toBe(65_535)
     expect(service.imageLimits).toEqual({
       maxImageBytes: DEFAULT_MAX_IMAGE_BYTES,
       maxImagesPerMessage: DEFAULT_MAX_IMAGES_PER_MESSAGE,
@@ -85,8 +85,23 @@ describe('local attachment service', () => {
         String(ref.attachmentId).slice('sha256:'.length),
       ))
       await expect(readFile(hostPath)).resolves.toEqual(Buffer.from(data))
-      const request = await service.readImageRequest(ref, { maxPixels: 1, maxBytes: 1024 })
+      const request = await service.readImageRequest(ref, { width: 1, height: 1, maxBytes: 1024 })
       expect(request).not.toHaveProperty('access')
+
+      const fileData = Uint8Array.of(0, 1, 2, 255)
+      const fileRef = await service.saveFile({ data: fileData, name: 'notes.bin' })
+      const filePath = service.fileHostPath(fileRef)
+      expect(filePath).toContain(join('files', String(fileRef.attachmentId).slice(7, 9)))
+      await expect(readFile(filePath)).resolves.toEqual(Buffer.from(fileData))
+
+      const streamRef = await service.saveFileStream({
+        data: (async function* (): AsyncIterable<Uint8Array> { yield fileData })(),
+        name: 'stream.bin',
+      })
+      await expect(readFile(service.fileHostPath(streamRef))).resolves.toEqual(Buffer.from(fileData))
+      const streamed: Uint8Array[] = []
+      for await (const chunk of service.readFileStream(streamRef)) streamed.push(chunk)
+      expect(Buffer.concat(streamed)).toEqual(Buffer.from(fileData))
     } finally {
       await rm(dshHome, { recursive: true, force: true })
     }

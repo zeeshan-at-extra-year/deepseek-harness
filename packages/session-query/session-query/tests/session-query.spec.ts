@@ -1,4 +1,5 @@
 import { createUserMessage, createMessage } from '@deepseek-ai/dsh-llm'
+import type { ContextFormed, MessageSource } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import { Context, type Fiber } from '@deepseek-ai/cordis'
 import SessionStore, { SessionLogOffset, SessionSeq, SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
@@ -14,6 +15,7 @@ import type {
   SessionAccess,
   SessionHandle,
   SessionHandleReadOptions,
+  SessionHandleReadResult,
   SessionPersistenceSnapshot,
 } from '@deepseek-ai/dsh-session-persistence'
 import SessionQueryEngine, {
@@ -23,6 +25,19 @@ import SessionQueryEngine, {
 } from '@deepseek-ai/dsh-session-query'
 import { SessionTitleProviderId, SessionTitleService } from '@deepseek-ai/dsh-session-title'
 import { TestSessionQueryEngine } from './test-service.ts'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'test': { kind: 'test' } & ContextFormed
+  }
+}
+
+type CheckpointSource = Extract<MessageSource, { readonly kind: 'compact-checkpoint' }>
+
+/** Build a typed checkpoint source for a query fixture without owning compaction. */
+function checkpointSource(compactionId: string): CheckpointSource {
+  return { kind: 'compact-checkpoint', compactionId: compactionId as CheckpointSource['compactionId'] }
+}
 
 const TITLE_SERVICE_CONFIG = { fallbackMaxWords: 8, fallbackMaxBytes: 64, maxTitleBytes: 256 }
 
@@ -51,7 +66,7 @@ class TestHandle implements SessionHandle {
     readonly access: SessionAccess,
   ) {}
 
-  read(offset = 0, length?: number, options?: SessionHandleReadOptions): Promise<readonly SessionEvent[]> {
+  read(offset = 0, length?: number, options?: SessionHandleReadOptions): Promise<SessionHandleReadResult> {
     TestPersistence.readCalls.push(this.id)
     TestPersistence.readSignals.push(options?.signal)
     const slice = (events: SessionEvent[]): SessionEvent[] => {
@@ -59,7 +74,9 @@ class TestHandle implements SessionHandle {
       return length === undefined ? from : from.slice(0, length)
     }
     if (TestPersistence.readOverride !== undefined) {
-      return TestPersistence.readOverride(this.id, options?.signal).then(loaded => slice(loaded.events))
+      return TestPersistence.readOverride(this.id, options?.signal).then(loaded => ({
+        eventState: 'detached', events: structuredClone(slice(loaded.events)),
+      } as const))
     }
     if (TestPersistence.readFailure !== undefined) return rejectUnknown(TestPersistence.readFailure)
     const entry = TestPersistence.entries.get(this.id)
@@ -67,7 +84,7 @@ class TestHandle implements SessionHandle {
     const result = structuredClone(entry.events)
     TestPersistence.readEffect?.()
     TestPersistence.readEffect = undefined
-    return Promise.resolve(slice(result))
+    return Promise.resolve({ eventState: 'detached', events: slice(result) })
   }
 
   append(events: readonly SessionEvent[]): Promise<void> {
@@ -548,7 +565,7 @@ describe('session-query exact reads', () => {
     await expect(ctx.sessionQuery.readTitle(shared.id)).resolves.toMatchObject({
       title: 'Live title', eventSeq: 0,
     })
-    expect(Object.keys((await ctx.sessionQuery.listSessions())[0]!)).toEqual(['header', 'live', 'persisted'])
+    expect(Object.keys((await ctx.sessionQuery.listSessions())[0]!)).toEqual(['header', 'live', 'persisted', 'formatStatus'])
   })
 
   it('batches unique persisted title observations through one cancellable corpus scan', async () => {
@@ -901,6 +918,45 @@ describe('session-query exact reads', () => {
     expect(older.header.createdAt).toBe(1)
   })
 
+  it('preserves listed format status with live precedence without opening stored logs', async () => {
+    const historical = header('format-historical', 1)
+    const current = header('format-current', 2)
+    const unknown = header('format-unknown', 3)
+    const shared = header('format-shared', 4)
+    TestPersistence.reset()
+    const ctx = await liveContext()
+    ctx.sessions.create(shared.id, { meta: { createdAt: shared.createdAt } })
+    const liveOnly = ctx.sessions.create(SessionId('format-live'), { meta: { createdAt: 5 } })
+    await ctx.plugin(TestPersistence)
+    const list = vi.spyOn(ctx.sessionPersistence, 'list').mockResolvedValue([
+      { header: historical, revision: SessionPersistenceRevision('historical'), formatStatus: 'migration-required' },
+      { header: current, revision: SessionPersistenceRevision('current'), formatStatus: 'current' },
+      { header: unknown, revision: SessionPersistenceRevision('unknown') },
+      { header: shared, revision: SessionPersistenceRevision('shared'), formatStatus: 'migration-required' },
+    ])
+    const stat = vi.spyOn(ctx.sessionPersistence, 'stat')
+    const open = vi.spyOn(ctx.sessionPersistence, 'open')
+    try {
+      const records = await ctx.sessionQuery.listSessions()
+      const byId = new Map(records.map(record => [record.header.id, record]))
+      expect(byId.get(historical.id)).toMatchObject({ live: false, persisted: true, formatStatus: 'migration-required' })
+      expect(byId.get(current.id)).toMatchObject({ live: false, persisted: true, formatStatus: 'current' })
+      expect(byId.get(unknown.id)).toMatchObject({ live: false, persisted: true })
+      expect(byId.get(unknown.id)).not.toHaveProperty('formatStatus')
+      expect(byId.get(shared.id)).toMatchObject({ live: true, persisted: true, formatStatus: 'current' })
+      expect(byId.get(liveOnly.id)).toMatchObject({ live: true, persisted: false, formatStatus: 'current' })
+      expect(list).toHaveBeenCalledTimes(1)
+      expect(stat).not.toHaveBeenCalled()
+      expect(open).not.toHaveBeenCalled()
+      expect(TestPersistence.readCalls).toEqual([])
+    } finally {
+      list.mockRestore()
+      stat.mockRestore()
+      open.mockRestore()
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('filters sessions symmetrically and owns mutable filter values immediately', async () => {
     const durable = header('durable-filter', 1)
     TestPersistence.reset([{ meta: durable, events: eventLog('durable') }])
@@ -947,25 +1003,18 @@ describe('session-query exact reads', () => {
       }),
       { surfaceOp: 'append' },
     )
-    session.append('assistant/chunk', {
+    session.append('assistant/attempt', {
       turn: 1,
       step: 1,
-      chunk: { type: 'text-delta', index: 0, text: 'draft' },
+      stream: [{ type: 'text-chunks', time0: 0, index: 0, dt: [], texts: ['draft'] }],
     })
     session.append(
-      'assistant/message',
-      {
-        turn: 1, step: 1,
-        message: createMessage({
-          role: 'assistant',
-          content: [{ type: 'text', text: 'replacement' }],
-          source: {
-            kind: 'model',
-            ...{ provider: 'mock', model: 'mock' },
-          },
-        }),
-      },
-      { surfaceOp: { op: 'replace', start: first.seq, end: first.seq }, sourceEventSeqs: [first.seq] },
+      'user/message',
+      createUserMessage({
+        content: [{ type: 'text', text: 'replacement' }],
+        source: { kind: 'test' },
+      }),
+      { surfaceOp: { op: 'replace', startSeq: first.seq, endSeq: first.seq }, sourceEventSeqs: [first.seq] },
     )
 
     expect((await ctx.sessionQuery.listEvents(session.id)).slice(2).map(record => record.surface))
@@ -982,17 +1031,17 @@ describe('session-query exact reads', () => {
       }),
       { surfaceOp: 'append' },
     )
-    session.append('assistant/chunk', {
+    session.append('assistant/attempt', {
       turn: 1,
       step: 1,
-      chunk: { type: 'text-delta', index: 0, text: 'draft' },
+      stream: [{ type: 'text-chunks', time0: 0, index: 0, dt: [], texts: ['draft'] }],
     })
     session.append(
       'user/message',
       createUserMessage({
-        content: [{ type: 'text', text: 'checkpoint' }], source: { kind: 'plugin', plugin: 'compact' },
+        content: [{ type: 'text', text: 'checkpoint' }], source: checkpointSource('query-compaction-1'),
       }),
-      { surfaceOp: { op: 'replace', start: first.seq, end: first.seq }, sourceEventSeqs: [first.seq] },
+      { surfaceOp: { op: 'replace', startSeq: first.seq, endSeq: first.seq }, sourceEventSeqs: [first.seq] },
     )
     const retained = session.append(
       'user/message',
@@ -1004,13 +1053,14 @@ describe('session-query exact reads', () => {
     session.append(
       'user/message',
       createUserMessage({
-        content: [{ type: 'text', text: 'latest checkpoint' }], source: { kind: 'plugin', plugin: 'compact' },
+        content: [{ type: 'text', text: 'latest checkpoint' }], source: checkpointSource('query-compaction-2'),
       }),
-      { surfaceOp: { op: 'replace', start: SessionSeq(2), end: retained.seq }, sourceEventSeqs: [SessionSeq(2), retained.seq] },
+      { surfaceOp: { op: 'replace', startSeq: SessionSeq(2), endSeq: retained.seq }, sourceEventSeqs: [SessionSeq(2), retained.seq] },
     )
     session.append(
       'assistant/message',
       {
+        stream: [],
         turn: 2, step: 1,
         message: createMessage({
           role: 'assistant',
@@ -1033,7 +1083,7 @@ describe('session-query exact reads', () => {
     ])
     if (snapshot.events[0]?.type !== 'user/message') throw new Error('expected current user message')
     expect(() => {
-      (snapshot.events[0]!.data as { content: unknown[] }).content = []
+      (snapshot.events[0]!.data as unknown as { content: unknown[] }).content = []
     }).toThrow()
     Object.assign(snapshot.session, { cwd: '/mutated' })
 
@@ -1129,7 +1179,7 @@ describe('session-query exact reads', () => {
     await expect(ctx.sessionQuery.listSessions()).rejects.toThrow(expectCode('SESSION_QUERY_SOURCE_CONFLICT'))
     await persistence.dispose()
     await expect(ctx.sessionQuery.listSessions()).resolves.toEqual([
-      { header: shared, live: true, persisted: false },
+      { header: shared, live: true, persisted: false, formatStatus: 'current' },
     ])
   })
 
@@ -1215,7 +1265,7 @@ describe('session-query exact reads', () => {
         data: createUserMessage({
           content: [{ type: 'text', text: 'hidden' }], source: { kind: 'user' },
         }),
-      }],
+      }] as unknown as SessionEvent[],
     }])
     const persistence = await ctx.plugin(TestPersistence)
     await expect(ctx.sessionQuery.listEvents(persisted.id))

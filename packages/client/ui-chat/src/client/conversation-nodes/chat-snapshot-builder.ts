@@ -1,18 +1,20 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { notifySubscribers } from '@deepseek-ai/dsh-client-store'
+import { notifySubscribers, type ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
 import type {
-  ConversationLocation, ConversationTimelineSnapshot, ConversationViewBuilder,
-  ConversationViewDefinition,
+  ConversationLocation, ConversationNode, ConversationTimelineSnapshot, ConversationViewBuilder,
+  ConversationViewDefinition, ConversationGroupInput, GroupNodePosition, NodeChange, NodeKey, PartialAssistant, RunningToolCall,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import type { ChatConversationViewNode, ChatNode } from '../contract/chat-nodes.ts'
+import type { ChatConversationViewNode, ChatNode, ChatNodeDataMap, ChatNodeKind } from '../contract/chat-nodes.ts'
 import { isRunningTool } from '../contract/chat-nodes.ts'
+import { isVisibleChatNode } from '../contract/chat-visibility.ts'
 import type {
   ChatLocationNodeIndex, ChatNodeProcessSource, ChatNodeSource, ChatNodeStore, ChatSnapshot,
-  ChatTurnNavigationIndex, ChatTurnProcessPresentation, ConversationNode, LegacyConversationSlice,
-  PartialAssistant, RunningToolCall, TurnNavigationItem,
+  ChatTurnNavigationIndex, ChatTurnProcessPresentation, LegacyConversationSlice, TurnNavigationItem,
 } from '../contract/snapshot.ts'
-import { TURN_PROCESS_INDEPENDENT_KINDS } from '../contract/turn-process.ts'
-import { sessionRecallLabels } from './event-projection.ts'
+import { isAtOrOutside } from '../contract/group-tree.ts'
+import { locationCoordinates } from './common.ts'
+import { sessionRecallLabels, skillInvocationName } from './event-projection.ts'
+import { GroupTreeSegments } from './group-tree-segments.ts'
 import { sameTurnNavigationItem, turnNavigationItem } from './turn-navigation.ts'
 import { ChatTurnProcessProjector } from './turn-process-presentation.ts'
 
@@ -66,13 +68,55 @@ class MutableChatSource<Value> {
 }
 /* jscpd:ignore-end */
 
+/** Membership is indexed on write; ordered arrays are materialized only for observed collections. */
+class TurnKindNodes {
+  private readonly nodes = new Map<string, ChatConversationViewNode>()
+  private current: readonly unknown[] = EMPTY_LIST
+  private dirty = false
+  private observable: MutableChatSource<readonly unknown[]> | undefined
+
+  source(): ObservableSnapshot<readonly unknown[]> {
+    return this.observable ??= new MutableChatSource(() => this.read(), '[ui-chat] turn kind nodes')
+  }
+
+  set(node: ChatConversationViewNode): void {
+    const previous = this.nodes.get(node.key)
+    this.nodes.set(node.key, node)
+    if (previous !== undefined && previous.data === node.data && previous.anchorSeq === node.anchorSeq) return
+    this.dirty = true
+  }
+
+  delete(key: string): void {
+    this.nodes.delete(key)
+    this.dirty = true
+  }
+
+  publish(): void {
+    this.observable?.publish()
+  }
+
+  private read(): readonly unknown[] {
+    if (this.dirty) {
+      this.current = [...this.nodes.values()].sort((a, b) => a.anchorSeq - b.anchorSeq).map(node => node.data)
+      this.dirty = false
+    }
+    return this.current
+  }
+}
+
 class MutableChatNodeStore implements ChatNodeStore {
   private readonly byKey = new Map<string, ChatConversationViewNode>()
   private readonly turnProcesses = new ChatTurnProcessProjector()
   private readonly sources = new Map<string, MutableChatSource<ChatConversationViewNode | undefined>>()
   private readonly processSources = new Map<string, MutableChatSource<ChatTurnProcessPresentation | undefined>>()
+  private readonly bottomSources = new Map<string, MutableChatSource<boolean>>()
+  /** Bottom membership: the latest loaded exchange. */
+  private readonly exchanges = new GroupTreeSegments('exchange')
   private readonly dirtyKeys = new Set<string>()
+  private readonly dirtyBottomKeys = new Set<string>()
   private readonly dirtyProcessKeys = new Set<string>()
+  private readonly turnKinds = new Map<number, Map<string, TurnKindNodes>>()
+  private readonly dirtyTurnKinds = new Set<TurnKindNodes>()
   private valuesCache: readonly ChatConversationViewNode[] = EMPTY_LIST
   private valuesDirty = false
 
@@ -85,6 +129,50 @@ class MutableChatNodeStore implements ChatNodeStore {
       () => this.get(key),
       `[ui-chat] node source ${key}`,
     ))
+  }
+
+  bottomSource(key: string): ObservableSnapshot<boolean> {
+    return cachedSource(this.bottomSources, key, () => new MutableChatSource(() => {
+      const node = this.get(key) as ChatNode | undefined
+      return node !== undefined && isVisibleChatNode(node)
+        && this.exchanges.inLatest(locationCoordinates(node.location).turn)
+    }, `[ui-chat] node bottom source ${key}`))
+  }
+
+  /**
+   * Settle the latest exchange for the loaded Turns and mark the Nodes of
+   * Turns that entered or left it.
+   * @param turnOrder - loaded Turns in ascending timeline order.
+   * @param locations - current Chat Location index.
+   */
+  settleBottom(turnOrder: readonly number[], locations: ChatLocationNodeIndex): void {
+    for (const turn of this.exchanges.settle(turnOrder)) {
+      for (const key of locations.getTurn(turn)) this.dirtyBottomKeys.add(key)
+    }
+  }
+
+  turnDataSource<Kind extends ChatNodeKind>(turn: number, kind: Kind): ObservableSnapshot<readonly ChatNodeDataMap[Kind][]> {
+    return this.turnKind(turn, kind).source() as ObservableSnapshot<readonly ChatNodeDataMap[Kind][]>
+  }
+
+  private turnKind(turn: number, kind: string): TurnKindNodes {
+    const kinds = cachedSource(this.turnKinds, turn, () => new Map<string, TurnKindNodes>())
+    return cachedSource(kinds, kind, () => new TurnKindNodes())
+  }
+
+  private updateTurnKind(previous: ChatConversationViewNode | undefined, next: ChatConversationViewNode | undefined): void {
+    const before = previous === undefined ? undefined : locationCoordinates(previous.location).turn
+    const after = next === undefined ? undefined : locationCoordinates(next.location).turn
+    if (previous !== undefined && before !== undefined && (before !== after || previous.kind !== next?.kind)) {
+      const collection = this.turnKind(before, previous.kind)
+      collection.delete(previous.key)
+      this.dirtyTurnKinds.add(collection)
+    }
+    if (next !== undefined && after !== undefined) {
+      const collection = this.turnKind(after, next.kind)
+      collection.set(next)
+      this.dirtyTurnKinds.add(collection)
+    }
   }
 
   processSource(key: string): ChatNodeProcessSource {
@@ -112,12 +200,16 @@ class MutableChatNodeStore implements ChatNodeStore {
     for (const node of nodes) {
       this.byKey.set(node.key, node)
       if (previous.get(node.key) !== node) {
+        this.updateTurnKind(previous.get(node.key), node)
+        this.exchanges.track(previous.get(node.key), node)
         this.dirtyKeys.add(node.key)
         this.dirtyProcessKeys.add(node.key)
       }
       previous.delete(node.key)
     }
     for (const key of previous.keys()) {
+      this.updateTurnKind(previous.get(key), undefined)
+      this.exchanges.track(previous.get(key), undefined)
       this.dirtyKeys.add(key)
       this.dirtyProcessKeys.add(key)
     }
@@ -129,6 +221,8 @@ class MutableChatNodeStore implements ChatNodeStore {
     let changed = false
     for (const node of nodes) {
       if (this.byKey.get(node.key) === node) continue
+      this.updateTurnKind(this.byKey.get(node.key), node)
+      this.exchanges.track(this.byKey.get(node.key), node)
       this.byKey.set(node.key, node)
       this.dirtyKeys.add(node.key)
       this.dirtyProcessKeys.add(node.key)
@@ -153,17 +247,24 @@ class MutableChatNodeStore implements ChatNodeStore {
 
   publish(): void {
     const dirty = [...this.dirtyKeys]
+    const dirtyBottom = new Set([...this.dirtyBottomKeys, ...dirty])
     const dirtyProcesses = [...this.dirtyProcessKeys]
+    const dirtyTurnKinds = [...this.dirtyTurnKinds]
     this.dirtyKeys.clear()
+    this.dirtyBottomKeys.clear()
     this.dirtyProcessKeys.clear()
+    this.dirtyTurnKinds.clear()
     for (const key of dirty) this.sources.get(key)?.publish()
+    for (const key of dirtyBottom) this.bottomSources.get(key)?.publish()
     for (const key of dirtyProcesses) this.processSources.get(key)?.publish()
+    for (const collection of dirtyTurnKinds) collection.publish()
   }
 }
 
 class MutableChatLocationIndex implements ChatLocationNodeIndex {
   private turns = new Map<number, readonly string[]>()
   private steps = new Map<string, readonly string[]>()
+  private positions = new Map<string, GroupNodePosition>()
 
   getTurn(turn: number): readonly string[] {
     return this.turns.get(turn) ?? EMPTY_KEYS
@@ -173,13 +274,32 @@ class MutableChatLocationIndex implements ChatLocationNodeIndex {
     return this.steps.get(stepKey(turn, step)) ?? EMPTY_KEYS
   }
 
-  rebuild(order: readonly string[], store: ChatNodeStore): void {
+  getPosition(key: string): GroupNodePosition | undefined {
+    return this.positions.get(key)
+  }
+
+  rebuild(order: readonly string[], store: ChatNodeStore): readonly number[] {
     const turns = new Map<number, string[]>()
     const steps = new Map<string, string[]>()
-    for (const key of order) {
+    const positions = new Map<string, GroupNodePosition>()
+    const changedTurns = new Set<number>()
+    for (const [index, key] of order.entries()) {
       const location = store.get(key)?.location
       if (location === undefined) continue
       const coordinates = locationCoordinates(location)
+      const previous = this.positions.get(key)
+      const position: GroupNodePosition = {
+        turn: coordinates.turn,
+        previous: order[index - 1] as NodeKey | undefined,
+        next: order[index + 1] as NodeKey | undefined,
+      }
+      const unchanged = previous !== undefined && previous.turn === position.turn
+        && previous.previous === position.previous && previous.next === position.next
+      positions.set(key, unchanged ? previous : position)
+      if (!unchanged) {
+        if (previous?.turn !== undefined) changedTurns.add(previous.turn)
+        if (position.turn !== undefined) changedTurns.add(position.turn)
+      }
       if (coordinates.turn === undefined) continue
       const turnKeys = turns.get(coordinates.turn) ?? []
       turnKeys.push(key)
@@ -190,8 +310,13 @@ class MutableChatLocationIndex implements ChatLocationNodeIndex {
       stepKeys.push(key)
       steps.set(step, stepKeys)
     }
+    for (const [key, position] of this.positions) {
+      if (!positions.has(key) && position.turn !== undefined) changedTurns.add(position.turn)
+    }
+    this.positions = positions
     this.turns = updateIndex(this.turns, turns)
     this.steps = updateIndex(this.steps, steps)
+    return [...changedTurns]
   }
 
   /** Invalidate aggregate readers when member data changes without moving. */
@@ -291,12 +416,6 @@ function stepKey(turn: number, step: number): string {
   return `${turn}:${step}`
 }
 
-function locationCoordinates(location: ConversationLocation): { turn?: number; step?: number } {
-  if (location.kind === 'step') return { turn: location.turn.turn, step: location.step.step }
-  if (location.kind === 'turn') return { turn: location.turn.turn }
-  return {}
-}
-
 function locationTurnStatus(location: ConversationLocation): string | undefined {
   return location.kind === 'turn' || location.kind === 'step' ? location.turn.status : undefined
 }
@@ -318,7 +437,7 @@ function processPresentationInputChanged(
 
 interface TurnProcessPresentation {
   readonly control?: ChatNode<'turn-process'>
-  readonly openingHumanAnchor?: number
+  readonly openingInputAnchor?: number
   readonly earliestProcessAnchor?: number
 }
 
@@ -337,15 +456,17 @@ function turnProcessPresentations(
     const location = node.location
     if (location.kind !== 'turn' && location.kind !== 'step') continue
     const current: TurnProcessPresentation = presentations.get(location.turn.turn) ?? {}
-    if ((node.kind === 'user' || node.kind === 'steering')
-      && node.anchorSeq < (current.control?.data.controlAnchorSeq ?? Number.POSITIVE_INFINITY)) {
+    const controlAnchor = current.control?.data.controlAnchorSeq
+    if (isAtOrOutside(node, 'input')
+      && controlAnchor !== undefined
+      && (controlAnchor === location.turn.start?.seq || node.anchorSeq < controlAnchor)) {
       presentations.set(location.turn.turn, {
         ...current,
-        openingHumanAnchor: Math.min(current.openingHumanAnchor ?? node.anchorSeq, node.anchorSeq),
+        openingInputAnchor: Math.max(current.openingInputAnchor ?? node.anchorSeq, node.anchorSeq),
       })
       continue
     }
-    if (TURN_PROCESS_INDEPENDENT_KINDS.has(node.kind)) continue
+    if (isAtOrOutside(node, 'turn')) continue
     presentations.set(location.turn.turn, {
       ...current,
       earliestProcessAnchor: Math.min(current.earliestProcessAnchor ?? node.anchorSeq, node.anchorSeq),
@@ -373,27 +494,27 @@ function presentationPosition(
   if (presentation === undefined) {
     return { anchor: node.anchorSeq, rank: 0, originalAnchor: node.anchorSeq }
   }
-  const openingHumanAnchor = presentation.openingHumanAnchor
-  if (openingHumanAnchor !== undefined
-    && node.anchorSeq < openingHumanAnchor
-    && !TURN_PROCESS_INDEPENDENT_KINDS.has(node.kind)) {
-    return { anchor: openingHumanAnchor, rank: 2, originalAnchor: node.anchorSeq }
+  const openingInputAnchor = presentation.openingInputAnchor
+  if (openingInputAnchor !== undefined
+    && node.anchorSeq < openingInputAnchor
+    && !isAtOrOutside(node, 'turn')) {
+    return { anchor: openingInputAnchor, rank: 2, originalAnchor: node.anchorSeq }
   }
   if (presentation.control !== undefined && node.key === presentation.control.key) {
-    return openingHumanAnchor === undefined
+    return openingInputAnchor === undefined
       ? {
         anchor: presentation.earliestProcessAnchor ?? node.anchorSeq,
         rank: -1,
         originalAnchor: node.anchorSeq,
       }
-      : { anchor: openingHumanAnchor, rank: 1, originalAnchor: node.anchorSeq }
+      : { anchor: openingInputAnchor, rank: 1, originalAnchor: node.anchorSeq }
   }
   return { anchor: node.anchorSeq, rank: 0, originalAnchor: node.anchorSeq }
 }
 
 /**
  * Order visible Chat Nodes without changing existing relative order as process
- * eligibility changes. Opening human input precedes process candidates, while
+ * eligibility changes. Opening input precedes process candidates, while
  * each synthetic process control sits between them.
  * @param nodes - currently materialized Chat Nodes.
  * @returns visible Nodes in presentation order.
@@ -401,7 +522,7 @@ function presentationPosition(
 export function orderedVisibleChatNodes(
   nodes: readonly ChatConversationViewNode[],
 ): ChatConversationViewNode[] {
-  const visible = nodes.filter(node => node.visibility === 'visible')
+  const visible = nodes.filter(node => isVisibleChatNode(node as ChatNode))
   const presentations = turnProcessPresentations(visible)
   return visible.sort((left, right) => {
     const leftPosition = presentationPosition(left, presentations)
@@ -506,6 +627,214 @@ class ReferenceLabelProjector {
   }
 }
 
+function withSkillNames(
+  node: ChatConversationViewNode,
+  names: readonly string[],
+): ChatConversationViewNode {
+  const candidate = node as ChatNode
+  if (candidate.kind !== 'user' && candidate.kind !== 'steering') return node
+  const current = candidate.data.skillNames ?? EMPTY_KEYS
+  const hasNames = Object.hasOwn(candidate.data, 'skillNames')
+  if (sameReferences(current, names) && hasNames === (names.length > 0)) return node
+  const data: Record<string, unknown> = { ...candidate.data }
+  if (names.length === 0) delete data.skillNames
+  else data.skillNames = names
+  return { ...candidate, data }
+}
+
+/** What skill-name batches are made of; every other Node is transparent. */
+type SlashEntryKind = 'message' | 'skill' | 'boundary'
+
+interface SlashEntry {
+  readonly key: string
+  readonly seq: number
+  readonly kind: SlashEntryKind
+  /** The injected skill name of a `skill` entry. */
+  readonly name: string | null
+}
+
+/**
+ * Classify one Node for batching: a direct message, a `skill-invocation`
+ * context, or a boundary of any other kind. A context that injects no skill
+ * (workspace rules, the catalog, a recall) is transparent and yields null.
+ */
+function slashEntryOf(node: ChatConversationViewNode): SlashEntry | null {
+  const candidate = node as ChatNode
+  if (candidate.kind === 'user' || candidate.kind === 'steering') {
+    return { key: node.key, seq: node.anchorSeq, kind: 'message', name: null }
+  }
+  if (candidate.kind === 'context') {
+    const name = skillInvocationName(candidate.data.source)
+    return name === null ? null : { key: node.key, seq: node.anchorSeq, kind: 'skill', name }
+  }
+  return { key: node.key, seq: node.anchorSeq, kind: 'boundary', name: null }
+}
+
+function sameSlashEntry(left: SlashEntry, right: SlashEntry): boolean {
+  return left.seq === right.seq && left.kind === right.kind && left.name === right.name
+}
+
+/**
+ * Attaches each direct message's step-loaded skill names to its Node.
+ *
+ * A step's `skill-invocation` injections follow the direct messages the host
+ * scanned for `/name` gestures and precede the step's first Node of any other
+ * kind, so every non-message, non-context Node closes a batch. Every ended
+ * Turn publishes its `turn-tail` Node on `turn/end` whatever the reason, so a
+ * batch never spans Turns, and `step/start` precedes the direct message in
+ * the log, so no boundary separates a message from its injections. Names
+ * attach to every direct message of the batch: the bubble decorates only the
+ * tokens its own text carries.
+ *
+ * The index holds only messages, skill injections, and boundaries, ordered by
+ * `anchorSeq`. An apply re-reads just the batches around the Nodes whose
+ * classification changed and never scans the store, so an assistant
+ * streaming frame costs nothing here (the append hot path never scans the
+ * Chat Nodes).
+ */
+export class SkillNameProjector {
+  private readonly entries = new Map<string, SlashEntry>()
+  /** Every indexed entry in `anchorSeq` order. */
+  private sorted: SlashEntry[] = []
+
+  /**
+   * Rebuild the index from a whole Node set and attach names to its messages.
+   * @param nodes - every materialized Chat Node, in any order.
+   * @returns the same Nodes, direct messages carrying their batch's names.
+   */
+  replace(nodes: readonly ChatConversationViewNode[]): readonly ChatConversationViewNode[] {
+    this.entries.clear()
+    this.sorted = []
+    for (const node of nodes) {
+      const entry = slashEntryOf(node)
+      if (entry === null) continue
+      this.entries.set(entry.key, entry)
+      this.sorted.push(entry)
+    }
+    this.sorted.sort((left, right) => left.seq - right.seq)
+    const names = new Map<string, readonly string[]>()
+    for (let index = 0; index < this.sorted.length; index++) {
+      if (this.sorted[index]?.kind === 'boundary') continue
+      const end = this.runEnd(index)
+      this.assignRun(index, end, names)
+      index = end
+    }
+    return nodes.map(node => withSkillNames(node, names.get(node.key) ?? EMPTY_KEYS))
+  }
+
+  /**
+   * Fold one incremental upsert set: re-read only the batches around the
+   * Nodes whose classification changed.
+   * @param upserts - the changed Nodes.
+   * @param store - the resident Nodes, read by key for the messages of an affected batch.
+   * @returns the upserts plus any resident message whose names changed.
+   */
+  apply(
+    upserts: readonly ChatConversationViewNode[],
+    store: ChatNodeStore,
+  ): readonly ChatConversationViewNode[] {
+    const dirty: number[] = []
+    for (const node of upserts) {
+      const next = slashEntryOf(node)
+      const previous = this.entries.get(node.key)
+      if (previous !== undefined) {
+        if (next !== null && sameSlashEntry(previous, next)) {
+          // A rebuilt message Node carries Definition state only, never the
+          // names a previous apply attached: re-read its batch.
+          if (next.kind === 'message') dirty.push(next.seq)
+          continue
+        }
+        this.remove(previous)
+        dirty.push(previous.seq)
+      }
+      if (next === null) continue
+      this.insert(next)
+      dirty.push(next.seq)
+    }
+    if (dirty.length === 0) return upserts
+    const names = new Map<string, readonly string[]>()
+    for (const seq of dirty) this.collectAround(seq, names)
+    const byKey = new Map(upserts.map(node => [node.key, node]))
+    for (const [key, list] of names) {
+      const node = byKey.get(key) ?? store.get(key)
+      if (node === undefined) continue
+      const next = withSkillNames(node, list)
+      if (next !== node || byKey.has(key)) byKey.set(key, next)
+    }
+    return [...byKey.values()]
+  }
+
+  private insert(entry: SlashEntry): void {
+    this.sorted.splice(this.lowerBound(entry.seq), 0, entry)
+    this.entries.set(entry.key, entry)
+  }
+
+  private remove(entry: SlashEntry): void {
+    this.sorted.splice(this.sorted.indexOf(entry), 1)
+    this.entries.delete(entry.key)
+  }
+
+  /** First index whose seq is at least `seq`. */
+  private lowerBound(seq: number): number {
+    let low = 0
+    let high = this.sorted.length
+    while (low < high) {
+      const middle = (low + high) >>> 1
+      if ((this.sorted[middle]?.seq ?? Number.POSITIVE_INFINITY) < seq) low = middle + 1
+      else high = middle
+    }
+    return low
+  }
+
+  /** Last index of the boundary-free run containing `index`. */
+  private runEnd(index: number): number {
+    let end = index
+    while (end + 1 < this.sorted.length && this.sorted[end + 1]?.kind !== 'boundary') end++
+    return end
+  }
+
+  /** First index of the boundary-free run containing `index`. */
+  private runStart(index: number): number {
+    let start = index
+    while (start - 1 >= 0 && this.sorted[start - 1]?.kind !== 'boundary') start--
+    return start
+  }
+
+  /** Record the names every message of the run `[start, end]` carries. */
+  private assignRun(start: number, end: number, names: Map<string, readonly string[]>): void {
+    const list: string[] = []
+    for (let index = start; index <= end; index++) {
+      const entry = this.sorted[index]
+      if (entry?.kind === 'skill' && entry.name !== null && !list.includes(entry.name)) list.push(entry.name)
+    }
+    for (let index = start; index <= end; index++) {
+      const entry = this.sorted[index]
+      if (entry?.kind === 'message') names.set(entry.key, list)
+    }
+  }
+
+  /**
+   * Re-read the run(s) around one changed seq: the run holding a message or
+   * skill entry, or — for a boundary, or a seq that left the index — the runs
+   * on both sides of that position.
+   */
+  private collectAround(seq: number, names: Map<string, readonly string[]>): void {
+    const at = this.lowerBound(seq)
+    const here = this.sorted[at]
+    if (here !== undefined && here.seq === seq && here.kind !== 'boundary') {
+      this.assignRun(this.runStart(at), this.runEnd(at), names)
+      return
+    }
+    if (at - 1 >= 0 && this.sorted[at - 1]?.kind !== 'boundary') {
+      this.assignRun(this.runStart(at - 1), at - 1, names)
+    }
+    const right = here !== undefined && here.seq === seq ? at + 1 : at
+    if (right < this.sorted.length && this.sorted[right]?.kind !== 'boundary') {
+      this.assignRun(right, this.runEnd(right), names)
+    }
+  }
+}
+
 interface LegacyContribution {
   readonly anchorSeq: number
   readonly nodes: readonly ConversationNode[]
@@ -523,8 +852,8 @@ const EMPTY_CONTRIBUTION: LegacyContribution = {
 function legacyContribution(raw: ChatConversationViewNode): LegacyContribution {
   const node = raw as ChatNode
   // Content-free settled Assistants remain in the finalized compatibility
-  // stream so StatsLine preserves its pre-assembly step counts; hidden running
-  // attempts have no final Node to contribute.
+  // stream so the composer stats pills keep their pre-assembly step counts;
+  // hidden running attempts have no final Node to contribute.
   if (raw.visibility !== 'visible' && node.kind !== 'assistant-step') return EMPTY_CONTRIBUTION
   switch (node.kind) {
     case 'user':
@@ -595,7 +924,7 @@ function sameContribution(left: LegacyContribution | undefined, right: LegacyCon
     && sameReferences(left.nodes, right.nodes)
 }
 
-/** Incremental compatibility projection for StatsLine and legacy top-level snapshot fields. */
+/** Incremental compatibility projection for the composer stats pills and legacy top-level snapshot fields. */
 class LegacySliceBuilder {
   private readonly contributions = new Map<string, LegacyContribution>()
   private readonly finalizedContributions = new Map<string, LegacyContribution>()
@@ -756,45 +1085,70 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
   private readonly navigation = new MutableTurnNavigationIndex()
   private readonly legacy = new LegacySliceBuilder()
   private readonly referenceLabels = new ReferenceLabelProjector()
+  private readonly skillNames = new SkillNameProjector()
   private order: readonly string[] = EMPTY_KEYS
+  private latestGroupInput: ConversationGroupInput<ChatConversationViewNode>
+  private readonly readGroupNode = (key: NodeKey): ChatConversationViewNode | undefined => this.store.get(key)
+  private readonly readGroupTurn = (turn: number): readonly NodeKey[] => this.locations.getTurn(turn) as readonly NodeKey[]
+  private readonly readGroupPosition = (key: NodeKey): GroupNodePosition | undefined => this.locations.getPosition(key)
   /** Last published timeline: a Turn boundary can land without a new node. */
   private timeline: ConversationTimelineSnapshot | null = null
   readonly empty: ChatSnapshot
 
   constructor() {
     this.empty = this.snapshot({ turnOrder: EMPTY_TURNS, turns: new Map() })
+    this.latestGroupInput = {
+      kind: 'replace',
+      order: this.order as readonly NodeKey[],
+      readNode: this.readGroupNode,
+      readTurn: this.readGroupTurn,
+      readPosition: this.readGroupPosition,
+      timeline: this.empty.timeline,
+    }
   }
 
   replace(input: {
     readonly nodes: readonly ChatConversationViewNode[]
     readonly timeline: ConversationTimelineSnapshot
   }): ChatSnapshot {
-    const nodes = this.referenceLabels.replace(input.nodes)
+    const nodes = this.skillNames.replace(this.referenceLabels.replace(input.nodes))
     this.store.replace(nodes)
     this.order = orderedVisibleChatNodes(nodes).map(node => node.key)
     this.locations.rebuild(this.order, this.store)
     this.store.replaceProcesses(this.order, this.locations)
+    this.store.settleBottom(input.timeline.turnOrder, this.locations)
     this.navigation.rebuild(input.timeline, this.locations, this.store)
     this.timeline = input.timeline
+    this.latestGroupInput = {
+      kind: 'replace',
+      order: this.order as readonly NodeKey[],
+      readNode: this.readGroupNode,
+      readTurn: this.readGroupTurn,
+      readPosition: this.readGroupPosition,
+      timeline: input.timeline,
+    }
     const snapshot = this.snapshot(input.timeline, this.legacy.replace(nodes, input.timeline))
-    this.store.publish()
     return snapshot
   }
 
   apply(input: {
     readonly upserts: readonly ChatConversationViewNode[]
     readonly timeline: ConversationTimelineSnapshot
+    readonly changedTurns?: readonly number[]
   }): ChatSnapshot {
-    const upserts = this.referenceLabels.apply(input.upserts, this.store)
+    const upserts = this.skillNames.apply(this.referenceLabels.apply(input.upserts, this.store), this.store)
     const processTurns = new Set<number>()
     let structural = false
     const contentOnly: ChatConversationViewNode[] = []
+    const changes: NodeChange<ChatConversationViewNode>[] = []
     for (const node of upserts) {
       const previous = this.store.get(node.key)
+      if (previous !== node) changes.push({ previous, current: node })
       const nodeStructural = previous === undefined
         || previous.kind !== node.kind
         || previous.anchorSeq !== node.anchorSeq
         || previous.visibility !== node.visibility
+        || previous.groupTree !== node.groupTree
         || locationIdentity(previous.location) !== locationIdentity(node.location)
       structural ||= nodeStructural
       if (!nodeStructural) contentOnly.push(node)
@@ -806,22 +1160,42 @@ export class ChatSnapshotBuilder implements ConversationViewBuilder<ChatConversa
       }
     }
     this.store.upsert(upserts)
+    let changedTurnOrders: readonly number[] = EMPTY_TURNS
     if (structural) {
       const next = orderedVisibleChatNodes(this.store.values()).map(node => node.key)
       this.order = sameReferences(this.order, next) ? this.order : next
-      this.locations.rebuild(this.order, this.store)
+      changedTurnOrders = this.locations.rebuild(this.order, this.store)
     }
     this.locations.touch(contentOnly)
     this.store.updateProcesses(processTurns, this.locations)
+    this.store.settleBottom(input.timeline.turnOrder, this.locations)
     if (structural || input.timeline !== this.timeline) {
       this.navigation.rebuild(input.timeline, this.locations, this.store)
     } else {
       this.navigation.touch(turnsOf(contentOnly), this.locations, this.store)
     }
     this.timeline = input.timeline
+    this.latestGroupInput = {
+      kind: 'apply',
+      changes,
+      order: this.order as readonly NodeKey[],
+      readNode: this.readGroupNode,
+      readTurn: this.readGroupTurn,
+      readPosition: this.readGroupPosition,
+      timeline: input.timeline,
+      changedTurns: input.changedTurns ?? EMPTY_TURNS,
+      changedTurnOrders,
+    }
     const snapshot = this.snapshot(input.timeline, this.legacy.apply(upserts, input.timeline))
-    this.store.publish()
     return snapshot
+  }
+
+  groupInput(): ConversationGroupInput<ChatConversationViewNode> {
+    return this.latestGroupInput
+  }
+
+  publish(): void {
+    this.store.publish()
   }
 
   private snapshot(

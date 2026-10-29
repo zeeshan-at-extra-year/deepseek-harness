@@ -5,6 +5,7 @@
 
 .rail {
   display: flex;
+  align-items: stretch;
   gap: 10px;
   overflow-x: auto;
   overflow-y: hidden;
@@ -22,9 +23,7 @@
 }
 
 .item {
-  position: relative;
-  flex: 0 0 64px;
-  width: 64px;
+  flex: none;
   height: 64px;
 }
 
@@ -34,7 +33,7 @@
   padding: 0;
   overflow: hidden;
   border: 0.5px solid var(--dsw-alias-border-l2-darkmode-thin);
-  border-radius: 16px;
+  border-radius: var(--dsw-radius-xl);
   background: var(--dsw-alias-interactive-bg-hover);
   cursor: zoom-in;
 }
@@ -66,13 +65,18 @@
   transition: opacity 0.2s ease-in-out;
 }
 
-.item:hover .remove,
 .remove:focus-visible {
   opacity: 1;
 }
 
+@media (hover: hover) {
+  .item:hover .remove {
+    opacity: 1;
+  }
+}
+
 /* Touch surfaces have no hover to reveal the control. */
-@media (pointer: coarse) {
+@media (hover: none), (pointer: coarse) {
   .remove {
     opacity: 1;
   }
@@ -83,7 +87,6 @@
     transition: none;
   }
 }
-
 .arrow {
   position: absolute;
   top: 50%;
@@ -104,8 +107,10 @@
   transform: translateY(-50%);
 }
 
-.arrow:hover {
-  background: var(--dsw-alias-interactive-bg-hover-solid);
+@media (hover: hover) {
+  .arrow:hover {
+    background: var(--dsw-alias-interactive-bg-hover-solid);
+  }
 }
 
 .arrowLeft {

@@ -7,14 +7,14 @@
 /** Request identifier minted by the page. */
 export type TunnelRequestId = string | number
 
-/** One request; `body` carries the raw bytes for methods that have one. */
+/** One request; `body` carries cloneable or transferable raw bytes. */
 export interface TunnelRequestFrame {
   readonly t: 'req'
   readonly id: TunnelRequestId
   readonly method: string
   readonly url: string
   readonly headers: Readonly<Record<string, string>>
-  readonly body?: ArrayBuffer | undefined
+  readonly body?: ArrayBuffer | Blob | ReadableStream<Uint8Array> | undefined
 }
 
 /** Open one Gateway Remote stream over the worker-local carrier. */
@@ -23,6 +23,19 @@ export interface TunnelStreamOpenFrame {
   readonly id: TunnelRequestId
   readonly endpoint: string
   readonly payload: unknown
+}
+
+/** One uplink item for an open Remote stream; `value` absent and `undefined` are equivalent. */
+export interface TunnelStreamUplinkItemFrame {
+  readonly t: 'stream-uplink-item'
+  readonly id: TunnelRequestId
+  readonly value?: unknown
+}
+
+/** Page-side half-close of a Remote stream's uplink. */
+export interface TunnelStreamUplinkEndFrame {
+  readonly t: 'stream-uplink-end'
+  readonly id: TunnelRequestId
 }
 
 /** Page-side cancellation of an in-flight request or stream. */
@@ -47,6 +60,8 @@ export type TunnelInboundFrame =
   | TunnelInitFrame
   | TunnelRequestFrame
   | TunnelStreamOpenFrame
+  | TunnelStreamUplinkItemFrame
+  | TunnelStreamUplinkEndFrame
   | TunnelAbortFrame
 
 /** Complete response for unary requests and static files. */
@@ -118,8 +133,17 @@ export interface TunnelStreamErrorFrame {
     }
 }
 
+/** Worker request to show one VFS text file in the page's read-only viewer; no reply follows. */
+export interface TunnelViewTextFrame {
+  readonly t: 'view-text'
+  /** Absolute VFS path, shown as the viewer title. */
+  readonly path: string
+  readonly text: string
+}
+
 /** Frames the worker emits. */
 export type TunnelOutboundFrame =
+  | TunnelViewTextFrame
   | TunnelResponseFrame
   | TunnelResponseHeadFrame
   | TunnelResponseChunkFrame
@@ -153,6 +177,8 @@ export function parseInboundFrame(data: unknown): TunnelInboundFrame {
     throw new Error(`webworker tunnel: frame has no usable id: ${JSON.stringify(frame.id)}`)
   }
   if (frame.t === 'abort') return { t: 'abort', id }
+  if (frame.t === 'stream-uplink-end') return { t: 'stream-uplink-end', id }
+  if (frame.t === 'stream-uplink-item') return { t: 'stream-uplink-item', id, value: frame.value }
   if (frame.t === 'stream-open') {
     if (typeof frame.endpoint !== 'string' || frame.endpoint.length === 0) {
       throw new Error(`webworker tunnel: stream ${String(id)} needs a non-empty endpoint`)
@@ -171,8 +197,11 @@ export function parseInboundFrame(data: unknown): TunnelInboundFrame {
     if (typeof value === 'string') headers[key.toLowerCase()] = value
   }
   const body = frame.body
-  if (body !== undefined && !(body instanceof ArrayBuffer)) {
-    throw new Error(`webworker tunnel: request ${String(id)} body must be an ArrayBuffer`)
+  if (body !== undefined
+    && !(body instanceof ArrayBuffer)
+    && !(body instanceof Blob)
+    && !(body instanceof ReadableStream)) {
+    throw new Error(`webworker tunnel: request ${String(id)} body must be an ArrayBuffer, Blob, or ReadableStream`)
   }
   return { t: 'req', id, method: frame.method, url: frame.url, headers, body }
 }

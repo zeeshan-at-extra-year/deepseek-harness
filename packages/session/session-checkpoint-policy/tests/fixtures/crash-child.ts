@@ -2,10 +2,9 @@ import { writeFile } from 'node:fs/promises'
 import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import { createUserMessage, ToolCallId, type GenerateOptions, LlmAdapter, type StreamChunk  } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import * as checkpointPolicy from '../../src/index.ts'
 
 function waitForCrash(): Promise<never> {
@@ -38,7 +37,6 @@ class CrashAdapter extends LlmAdapter {
 
 const ctx = new Context()
 await mountAgentLoopTestDependencies(ctx)
-await ctx.plugin(SessionProjectionRegistry)
 await ctx.plugin(AgentLoop, { agents: [] })
 await ctx.plugin(JsonlSessionPersistence, { root: persistenceRoot, compression: 'none' })
 await ctx.plugin(checkpointPolicy)

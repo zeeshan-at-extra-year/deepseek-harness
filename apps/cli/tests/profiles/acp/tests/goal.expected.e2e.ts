@@ -2,7 +2,9 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  fixtureContext,
   normalizeSessionSnapshot,
+  normalizeSessionSnapshots,
   normalizeStdout,
   runScenario,
   type AgentUnderTest,
@@ -62,6 +64,13 @@ function normalizeGoalLog(content: string, context: NormalizeContext): string {
   return normalizeGoalTimestamps(normalizeSessionSnapshot(content, context)) as string
 }
 
+/** Compare one current normalized goal log with its generation-aware committed fixture. */
+async function expectGoalLog(actual: string, expectedPath: string): Promise<void> {
+  const expected = await readFile(expectedPath, 'utf8')
+  expect(normalizeSessionSnapshots([actual], fixtureContext(actual)).map(parseJsonl))
+    .toEqual(normalizeSessionSnapshots([expected], fixtureContext(expected)).map(parseJsonl))
+}
+
 describe('same-session goal snapshot through the ACP automation driver', () => {
   it('runs exact automatic rounds in the shipped application and persists cancellation', async () => {
     const input = JSON.parse(await readFile(join(scenarioDir, 'input.json'), 'utf8')) as InputScript
@@ -78,7 +87,7 @@ describe('same-session goal snapshot through the ACP automation driver', () => {
     const log = result.sessionLogs[0]
     if (log === undefined) throw new Error('goal snapshot did not persist its session')
     const records = parseJsonl(log.content)
-    const events = records.slice(1) as unknown as SessionEvent[]
+    const events = records.slice(1) as SessionEvent[]
     const calls = events.filter(event => event.type === 'tool/call').map(event => event.data.name)
     expect(calls).toEqual(['create_goal', 'get_goal'])
     const rounds = events.flatMap(event => event.type === 'user/message' && event.data.source.kind === 'goal'
@@ -109,7 +118,7 @@ describe('same-session goal snapshot through the ACP automation driver', () => {
       ])
     }
     expect(stdout).toBe(await readFile(stdoutExpected, 'utf8'))
-    expect(session).toBe(await readFile(sessionExpected, 'utf8'))
+    await expectGoalLog(session, sessionExpected)
   })
 
   it('injects the wrap-up instruction after an autonomous completion and delivers a closing message', async () => {
@@ -127,7 +136,7 @@ describe('same-session goal snapshot through the ACP automation driver', () => {
     const log = result.sessionLogs[0]
     if (log === undefined) throw new Error('goal wrap-up snapshot did not persist its session')
     const records = parseJsonl(log.content)
-    const events = records.slice(1) as unknown as SessionEvent[]
+    const events = records.slice(1) as SessionEvent[]
     const calls = events.filter(event => event.type === 'tool/call').map(event => event.data.name)
     expect(calls).toEqual(['create_goal', 'update_goal'])
     expect(foldGoal(events)).toMatchObject({
@@ -141,7 +150,7 @@ describe('same-session goal snapshot through the ACP automation driver', () => {
     // The wrap-up instruction is one plugin-sourced context injected after the
     // terminal tool result, and the model still answers inside the same turn.
     const wrapups = events.filter(event => event.type === 'user/message'
-      && event.data.source.kind === 'plugin' && event.data.source.plugin === 'tool-goal')
+      && event.data.source.kind === 'tool-goal')
     expect(wrapups).toHaveLength(1)
     const wrapupText = wrapups.map(event => event.type === 'user/message' ? event.data.content : [])[0]
     expect(JSON.stringify(wrapupText)).toContain('<goal_complete>')
@@ -168,6 +177,6 @@ describe('same-session goal snapshot through the ACP automation driver', () => {
       ])
     }
     expect(stdout).toBe(await readFile(wrapupStdoutExpected, 'utf8'))
-    expect(session).toBe(await readFile(wrapupSessionExpected, 'utf8'))
+    await expectGoalLog(session, wrapupSessionExpected)
   })
 })

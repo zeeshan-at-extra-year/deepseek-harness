@@ -10,6 +10,8 @@ import { chromium } from 'playwright'
 import { afterAll, beforeAll, describe, expect, it, onTestFailed } from 'vitest'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { ReplayEntry } from '@deepseek-ai/dsh-llm-replay'
+import { sessionFixtureName } from '@deepseek-ai/dsh-session-snapshot'
+import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
 import { createChatScrollFixture } from './chat-scroll-fixture.ts'
 import {
   captureStableAria,
@@ -69,7 +71,7 @@ async function openSeed(page: Page): Promise<void> {
   // Search collapsed into a header action; expand it before filling.
   const searchButton = page.getByRole('button', { name: 'Search sessions' })
   if (await searchButton.getAttribute('aria-expanded') !== 'true') await searchButton.click()
-  const search = page.getByRole('textbox', { name: 'Search sessions...', exact: true })
+  const search = page.getByRole('textbox', { name: 'Search session names', exact: true })
   await search.fill(FIXTURE.markers.user(1))
   const result = page.getByRole('tree', { name: 'Search results' }).getByRole('treeitem')
   await expect.poll(() => result.count(), { timeout: 60_000 }).toBe(1)
@@ -153,10 +155,15 @@ async function rowTop(page: Page, key: string): Promise<number | null> {
 
 async function loadToFirstTurn(page: Page): Promise<void> {
   const marker = FIXTURE.markers.user(1)
+  const loadMore = page.locator('[data-history-load] button')
   for (let attempt = 0; attempt < 12; attempt += 1) {
+    if (await page.getByText(marker, { exact: false }).count() > 0) return
+    await expect.poll(() => loadMore.evaluateAll(buttons =>
+      buttons.length === 0 || !(buttons[0] as HTMLButtonElement).disabled,
+    ), { timeout: 15_000 }).toBe(true)
+    const before = await logicalRows(page)
     await scrollToRatio(page, 0)
     if (await page.getByText(marker, { exact: false }).count() > 0) return
-    const before = await logicalRows(page)
     const anchor = await firstVisibleRow(page)
     await expect.poll(async () => ({
       marker: await page.getByText(marker, { exact: false }).count() > 0,
@@ -180,7 +187,7 @@ describe('web e2e: Trajectory virtualization over tail-paged history', () => {
 
   beforeAll(async () => {
     replayDir = await mkdtemp(join(tmpdir(), 'dsh-trajectory-virtualization-'))
-    const replayFixture = join(replayDir, 'session.jsonl')
+    const replayFixture = join(replayDir, sessionFixtureName(0, SESSION_FORMAT_VERSION))
     const replayOverride = join(replayDir, 'replay.override.json')
     await writeFile(replayFixture, FIXTURE.log)
     await writeFile(replayOverride, JSON.stringify([{

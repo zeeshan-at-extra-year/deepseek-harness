@@ -6,7 +6,7 @@ import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { randomUUID } from 'node:crypto'
-import type { OAuthTokens, OAuthClientInformationMixed } from '@modelcontextprotocol/sdk/shared/auth.js'
+import type { OAuthTokens, OAuthClientInformationMixed } from '@modelcontextprotocol/client'
 import { buildAuthProvider, startCallbackServer } from '@deepseek-ai/dsh-mcp-client/src/auth.ts'
 
 let portSeq = 19200
@@ -137,7 +137,9 @@ describe('buildAuthProvider', () => {
 
     await provider.invalidateCredentials!('all')
     expect(await provider.clientInformation()).toBeUndefined()
-    expect(await provider.codeVerifier().catch(() => 'missing')).toBe('missing')
+    // The codeVerifier contract returns string | Promise<string>; normalize before handling rejection.
+    const verifier = await Promise.resolve(provider.codeVerifier()).catch(() => 'missing')
+    expect(verifier).toBe('missing')
     expect(await provider.discoveryState!()).toBeUndefined()
   })
 

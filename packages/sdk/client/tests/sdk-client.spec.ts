@@ -63,6 +63,33 @@ async function tempDir(prefix: string): Promise<string> {
 }
 
 describe('DeepSeekHarness', () => {
+  it('returns a restored handle that can run followups on the same identity', async () => {
+    const harness = harnessWith()
+    const session = await harness.resumeSession('saved-session')
+    expect(session.id).toBe('saved-session')
+    expect((await session.run('continue')).sessionId).toBe('saved-session')
+  })
+
+  it('propagates resume failures', async () => {
+    await expect(harnessWith({ FAKE_RESUME_ERROR: '1' }).resumeSession('missing'))
+      .rejects.toThrow('session not found')
+  })
+
+  it('reads and changes directories independently for each lazy Session', async () => {
+    const harness = harnessWith()
+    const first = harness.session('directory-first')
+    const second = harness.session('directory-second')
+    const origin = await first.getWorkingDirectory()
+    expect(await first.setWorkingDirectory('child')).toBe(join(origin, 'child'))
+    expect(await first.getWorkingDirectory()).toBe(join(origin, 'child'))
+    expect(await second.getWorkingDirectory()).toBe(origin)
+  })
+
+  it('rejects a malformed working-directory response', async () => {
+    const harness = harnessWith({ FAKE_MALFORMED_DIRECTORY: '1' })
+    await expect(harness.session().getWorkingDirectory()).rejects.toThrow('returned no working directory')
+    await expect(harness.session().setWorkingDirectory('.')).rejects.toThrow('returned no working directory')
+  })
   it('ignores notifications that precede the submitted message receipt', async () => {
     const notifications = [
       { method: 'session.status', params: { sessionId: 'owned', status: 'running' } },
@@ -121,12 +148,119 @@ describe('DeepSeekHarness', () => {
     expect(closed).toBe(true)
   })
 
+  it('preserves Auto review denial details in native and PTC session events', async () => {
+    const receipt = {
+      type: 'agent/inbox/spliced',
+      data: {
+        target: 'next-turn',
+        start: 0,
+        inserted: [{ id: 'accepted-message', role: 'user', content: [], source: { kind: 'user' } }],
+      },
+    }
+    const nativeResult = {
+      type: 'tool/result',
+      data: {
+        turn: 1,
+        step: 1,
+        message: {
+          source: { kind: 'tool', callId: 'native-call' },
+          content: [{
+            type: 'tool-result',
+            toolCallId: 'native-call',
+            content: [{ type: 'text', text: 'Error: blocked by policy' }],
+            isError: true,
+          }],
+          role: 'user',
+          id: 'native-result',
+        },
+        error: {
+          name: 'AutoReviewDeniedError',
+          code: 'AUTO_REVIEW_DENIED',
+          reason: ' native raw\nreason ',
+        },
+      },
+    }
+    const ptcStart = {
+      type: 'tool/ptc-dispatch-start',
+      data: {
+        rootCallId: 'run-code-call',
+        parentCallId: 'run-code-call',
+        subCallId: 'run-code-call:ptc:1',
+        name: 'bash',
+        arguments: { command: 'git push --force' },
+      },
+    }
+    const ptcResult = {
+      type: 'tool/ptc-dispatch',
+      data: {
+        rootCallId: 'run-code-call',
+        parentCallId: 'run-code-call',
+        subCallId: 'run-code-call:ptc:1',
+        name: 'bash',
+        arguments: { command: 'git push --force' },
+        isError: true,
+        content: [{ type: 'text', text: 'Error: blocked by policy' }],
+        meta: { cwd: '/selected', path: '/selected/note.txt', view: { line: 3 } },
+        error: {
+          name: 'AutoReviewDeniedError',
+          code: 'AUTO_REVIEW_DENIED',
+          reason: ' ptc raw\nreason ',
+        },
+      },
+    }
+    const notifications = [
+      { method: 'session.event', params: { sessionId: 'owned', event: receipt } },
+      { method: 'session.event', params: { sessionId: 'owned', event: nativeResult } },
+      { method: 'session.event', params: { sessionId: 'owned', event: ptcStart } },
+      { method: 'session.event', params: { sessionId: 'owned', event: ptcResult } },
+      { method: 'session.status', params: { sessionId: 'owned', status: 'idle' } },
+    ] as HarnessNotification[]
+    const harness = {
+      start: () => Promise.resolve(),
+      client: {
+        prompt: () => Promise.resolve('accepted-message'),
+        subscribeSessionTree: () => ({
+          next: async () => {
+            const notification = notifications.shift()
+            if (notification === undefined) throw new Error('scripted notification queue exhausted')
+            return notification
+          },
+          tryNext: () => notifications.shift(),
+          close: () => {},
+          async * [Symbol.asyncIterator]() {},
+        }),
+      },
+    } as unknown as DeepSeekHarness
+
+    const result = await new HarnessSession(harness, 'owned').run('go')
+
+    expect(result.events).toEqual([receipt, nativeResult, ptcStart, ptcResult])
+    expect(result.events.find(event => event.type === 'tool/ptc-dispatch')?.data.meta)
+      .toEqual({ cwd: '/selected', path: '/selected/note.txt', view: { line: 3 } })
+    for (const event of result.events.filter(event => event.type.startsWith('tool/ptc-dispatch'))) {
+      expect(event.data).not.toHaveProperty('description')
+      expect(event.data).not.toHaveProperty('parameters')
+      expect(event.data).not.toHaveProperty('schema')
+    }
+  })
+
   it('runs a turn end to end and reuses the runtime across sessions', async () => {
     const harness = harnessWith({ FAKE_TEXT: 'turn answer' })
     const first = await harness.run('say hi')
     expect(first.finalResponse).toBe('turn answer')
     expect(first.events.map(event => event.type)).toEqual([
-      'agent/inbox/spliced', 'turn/start', 'assistant/chunk', 'assistant/message', 'turn/end',
+      'agent/inbox/spliced', 'turn/start', 'assistant/message', 'turn/end',
+    ])
+    const message = first.events.find(event => event.type === 'assistant/message')
+    expect(message?.data.stream).toEqual([
+      { type: 'chunk', time: 0, chunk: { type: 'block-start', index: 0, blockType: 'text' } },
+      { type: 'text-chunks', time0: 0, index: 0, dt: [], texts: ['turn answer'] },
+      {
+        type: 'chunk',
+        time: 0,
+        chunk: { type: 'block-end', index: 0, block: { type: 'text', text: 'turn answer' } },
+      },
+      { type: 'chunk', time: 0, chunk: { type: 'finish', reason: { kind: 'stop' } } },
     ])
 
     // Same subprocess, second session: ids differ, protocol state is reusable.
@@ -165,6 +299,7 @@ describe('DeepSeekHarness', () => {
       model: 'custom-model',
       reasoningEffort: ReasoningEffortId('max'),
       maxTokens: 4096,
+      approvalRequests: true,
     })
     cleanups.push(() => harness.close())
     await harness.run('one')
@@ -177,6 +312,7 @@ describe('DeepSeekHarness', () => {
       model: 'custom-model',
       reasoningEffort: 'max',
       maxTokens: 4096,
+      approvalRequests: true,
     }])
   })
 
@@ -543,6 +679,9 @@ describe('HarnessClient', () => {
     const inject = (method: string, params: Record<string, unknown>): void => {
       (client as unknown as { dispatchNotification(n: HarnessNotification): void }).dispatchNotification({ method, params })
     }
+    const unknownChild = { type: 'subagent/catalog', seq: 0, time: 1,
+      data: { version: 1, childId: 'unreadable-child', childCreatedAt: 1, mode: 'unknown' } }
+    inject('session.event', { sessionId: 'root', event: unknownChild })
     inject('subagent.started', { parentSessionId: 'root', childSessionId: 'child' })
     inject('subagent.started', { parentSessionId: 'child', childSessionId: 'grandchild' })
     inject('session.event', { sessionId: 'grandchild', event: { type: 'noop' } })
@@ -554,6 +693,7 @@ describe('HarnessClient', () => {
     inject('subagent.started', { parentSessionId: '', childSessionId: 'x' })
     inject('subagent.finished', { childSessionId: 'root' })
 
+    expect(await tree.next()).toEqual({ method: 'session.event', params: { sessionId: 'root', event: unknownChild } })
     expect((await tree.next()).method).toBe('subagent.started')
     expect((await tree.next()).method).toBe('subagent.started')
     expect((await tree.next()).params.sessionId).toBe('grandchild')
@@ -625,5 +765,34 @@ describe('pure helpers', () => {
       { type: 'assistant/message', seq: 0, time: 0, data: { message: { content: [{ type: 'text', text: 'first' }] } } } as never,
       { type: 'assistant/message', seq: 1, time: 0, data: { message: { content: [{ type: 'text', text: 'a' }, { type: 'tool-call' }, { type: 'text', text: 'b' }] } } } as never,
     ])).toBe('ab')
+  })
+})
+
+describe('server-to-client SDK requests', () => {
+  it('requires a started client and returns client decisions over the wire', async () => {
+    const client = processClient(fakeLaunch({ FAKE_APPROVAL: '1' }))
+    cleanups.push(() => client.close())
+    expect(() => { client.onRequest(async () => ({})) }).toThrow('start the SDK client')
+    client.start()
+    client.onRequest(async (method, params) => {
+      expect(method).toBe('approval/request')
+      expect(params).toEqual({ sessionId: 'main', toolName: 'bash' })
+      return { outcome: 'rejected' }
+    })
+    const notifications = client.subscribe()
+    await client.initialize({ cwd: process.cwd(), provider: 'mock', model: 'mock', approvalRequests: true })
+    expect(await notifications.next()).toMatchObject({ method: 'approval/response', params: { result: { outcome: 'rejected' } } })
+    notifications.close()
+    await client.close()
+    expect(() => { client.onRequest(async () => ({})) }).toThrow('client is closed; create a new client')
+  })
+})
+
+describe('SDK cancellation reason projection', () => {
+  it.each(['user', 'parent', 'disposed', 'legacy'])('retains the %s cancellation cause', async (kind) => {
+    const harness = harnessWith({ FAKE_REASON_KIND: 'aborted', FAKE_ABORT_REASON_KIND: kind })
+    const result = await harness.run('cancelled')
+    expect(result.events.findLast(event => event.type === 'turn/end')?.data.reason)
+      .toEqual({ kind: 'aborted', reason: { kind } })
   })
 })

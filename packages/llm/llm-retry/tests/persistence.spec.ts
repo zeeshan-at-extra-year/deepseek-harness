@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import { RetryId } from '@deepseek-ai/dsh-llm-retry'
 import type {} from '../src/index.ts'
 
@@ -57,7 +57,7 @@ describe('JSONL retry-event persistence', () => {
       const reader = await ctx.sessionPersistence.open(session.id, 'read')
       try {
         const loaded = await reader.read()
-        expect(loaded.find(item => item.type === 'llm/retry')).toEqual(event)
+        expect(loaded.events.find(item => item.type === 'llm/retry')).toEqual(event)
       } finally {
         await reader.close()
       }

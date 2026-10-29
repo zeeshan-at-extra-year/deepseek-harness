@@ -1,11 +1,9 @@
-import { describe, expect, expectTypeOf, it } from 'vitest'
+import { unsupportedModel } from '@deepseek-ai/dsh-agent-loop-testkit'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+import { describe, expect, expectTypeOf, it, onTestFinished } from 'vitest'
 import { Context, Service, symbols } from '@deepseek-ai/cordis'
-import { createUserMessage, freezeMessage } from '@deepseek-ai/dsh-llm'
-import { Session, SessionId, type UserMessage } from '@deepseek-ai/dsh-session'
-import AgentRegistry, {
-  agentEvents,
-  Inbox,
-} from '@deepseek-ai/dsh-agent'
+import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import AgentRegistry, { agentEvents } from '@deepseek-ai/dsh-agent'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 
 import type {
@@ -19,14 +17,18 @@ import type {
 
 function stubAgent(rawId: string, overrides: Partial<Agent> = {}): Agent {
   const id = SessionId(rawId)
-  const session = Session.create(id)
+  const session = overrides.session ?? Session.create(id)
+  const ctx = overrides.ctx ?? new Context()
   const agent: Agent = {
     id,
     options: {},
     session,
-    inbox: new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} }),
+    model: unsupportedModel(),
+    inbox: {
+      nextTurn: [], nextStep: [],
+    } as never,
     status: 'idle',
-    ctx: new Context(),
+    ctx,
     send: () => {},
     followup: () => {},
     steer: () => ({ outcome: Promise.resolve({ status: 'rejected' as const }) }),
@@ -34,138 +36,59 @@ function stubAgent(rawId: string, overrides: Partial<Agent> = {}): Agent {
     cancel() {},
     runMaintenance: task => task(new AbortController().signal),
     whenIdle: () => Promise.resolve(),
+    ...overrides,
   }
-  return Object.assign(agent, overrides)
+  return agent
 }
 
-describe('Inbox', () => {
-  it('rejects an invalid durable splice during reconstruction', () => {
-    const session = Session.create(SessionId('invalid-inbox-replay'))
-    session.append('agent/inbox/spliced', {
-      target: 'next-turn',
-      start: 1,
-      inserted: [],
-    })
-
-    expect(() => new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} }))
-      .toThrow('invalid persisted inbox splice at session seq 0')
-  })
-
-  it('replaces a pending message by identity across both lists', () => {
-    const session = Session.create(SessionId('replace-inbox'))
-    const inserted: UserMessage[] = []
-    const discarded: UserMessage[] = []
-    const inbox = new Inbox(session, {
-      claimed: () => {},
-      inserted: message => void inserted.push(message),
-      discarded: message => void discarded.push(message),
-    })
-    const original = createUserMessage({
-      content: [{ type: 'text', text: 'original' }],
-      source: { kind: 'user' },
-    })
-    const nextStep = createUserMessage({
-      content: [{ type: 'text', text: 'step' }],
-      source: { kind: 'user' },
-    })
-    const replacement = createUserMessage({
-      content: [{ type: 'text', text: 'replacement' }],
-      source: { kind: 'user' },
-    })
-    const editedStep = freezeMessage({
-      ...nextStep,
-      content: [{ type: 'text', text: 'edited step' }],
-    })
-    inbox.append('next-turn', original)
-    inbox.append('next-step', nextStep)
-
-    expect(inbox.replace(createUserMessage({
-      content: [{ type: 'text', text: 'missing' }],
-      source: { kind: 'user' },
-    }).id, replacement)).toBe(false)
-    expect(inbox.replace(original.id, replacement)).toBe(true)
-    expect(inbox.replace(nextStep.id, editedStep)).toBe(true)
-    expect(inbox.nextTurn).toEqual([replacement])
-    expect(inbox.nextStep).toEqual([editedStep])
-    expect(discarded).toEqual([original, nextStep])
-    expect(inserted).toEqual([original, nextStep, replacement, editedStep])
-    expect(() => { inbox.replace(editedStep.id, replacement) })
-      .toThrow(`message "${replacement.id}" is already pending`)
-  })
-
-  it('normalizes splice coordinates, rejects duplicate identities, and reports missing removals', () => {
-    const session = Session.create(SessionId('splice-inbox'))
-    const inbox = new Inbox(session, { inserted: () => {}, discarded: () => {}, claimed: () => {} })
-    const first = createUserMessage({
-      content: [{ type: 'text', text: 'first' }],
-      source: { kind: 'user' },
-    })
-    const second = createUserMessage({
-      content: [{ type: 'text', text: 'second' }],
-      source: { kind: 'user' },
-    })
-
-    inbox.splice('next-turn', Number.NaN, Number.NaN, [first, second])
-    expect(inbox.nextTurn).toEqual([first, second])
-    expect(inbox.splice('next-turn', -1, 1, [])).toEqual([second])
-    expect(inbox.remove(second.id)).toBe(false)
-    expect(() => { inbox.append('next-step', first) }).toThrow(`message "${first.id}" is already pending`)
-  })
-
-  it('clears both pending lists as durable cancellations', () => {
-    const session = Session.create(SessionId('clear-inbox'))
-    const discarded: UserMessage[] = []
-    const inbox = new Inbox(session, {
-      claimed: () => {},
-      inserted: () => {},
-      discarded: message => void discarded.push(message),
-    })
-    const nextTurn = createUserMessage({ content: [{ type: 'text', text: 'turn' }], source: { kind: 'user' } })
-    const nextStep = createUserMessage({ content: [{ type: 'text', text: 'step' }], source: { kind: 'user' } })
-    inbox.append('next-turn', nextTurn)
-    inbox.append('next-step', nextStep)
-    const beforeClear = session.snapshotEvents().length
-
-    inbox.clear()
-
-    expect(inbox.hasPending).toBe(false)
-    expect(discarded).toEqual([nextStep, nextTurn])
-    expect(session.snapshotEvents().slice(beforeClear).map(event => event.type === 'agent/inbox/spliced'
-      ? event.data
-      : event.type)).toEqual([
-      { target: 'next-step', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' },
-      { target: 'next-turn', start: 0, removedCount: 1, inserted: [], outcome: 'canceled' },
-    ])
-
-    inbox.clear()
-    expect(session.snapshotEvents()).toHaveLength(beforeClear + 2)
-  })
-})
-
 describe('AgentRegistry', () => {
+  it('waits for its projection owner and reads turn positions without a loop', async () => {
+    const ctx = new Context()
+    onTestFinished(() => ctx.fiber.dispose())
+    const fiber = ctx.plugin(AgentRegistry)
+    expect(ctx.get('agents')).toBeUndefined()
+    await ctx.plugin(SessionProjectionRegistry)
+    await fiber
+    const session = Session.create(SessionId('turn-positions'))
+    expect(ctx.agents.turnBoundaryOf(session)).toEqual({
+      openTurnStartSeq: null, lastStepStartSeq: null, lastStepBoundary: null, lastTurn: 0,
+    })
+    const turn = session.append('turn/start', { turn: 3 })
+    const step = session.append('step/start', { turn: 3, step: 1 })
+    expect(ctx.agents.turnBoundaryOf(session)).toEqual({
+      openTurnStartSeq: turn.seq, lastStepStartSeq: step.seq,
+      lastStepBoundary: { kind: 'start', seq: step.seq }, lastTurn: 3,
+    })
+    session.append('turn/end', { turn: 3, reason: { kind: 'completed' } })
+    expect(ctx.agents.turnBoundaryOf(session)).toMatchObject({ openTurnStartSeq: null, lastTurn: 3 })
+    expect(ctx.sessionProjections.checkpoint(session).turnBoundary).toBeDefined()
+    await fiber.dispose()
+    expect(ctx.sessionProjections.checkpoint(session).turnBoundary).toBeUndefined()
+  })
+
   it('contributes Agent lookup and scoped Context providers while Typert is live', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     const agentFiber = ctx.plugin(AgentRegistry)
     await agentFiber
     await ctx.plugin(TypertRegistry)
     const agent = stubAgent('remote-agent')
-    Object.defineProperty(agent, 'ctx', { value: agent.ctx.extend({ agent }) })
-    const disposeAgent = ctx.agents.register(agent)
+    const disposeAgent = await ctx.agents.register(agent)
 
     const lookup = ctx.typert.lookups.get('agent')
     expect(lookup).toMatchObject({
       parameter: 'agent',
       wire: 'agentId',
+      resource: 'session',
       hostTypeSymbol: '@deepseek-ai/dsh-agent#Agent',
       wireTypeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
     })
     expect(lookup?.resolve(agent.id)).toBe(agent)
     const context = ctx.typert.contexts.getHost('agent')
-    expect(context?.identity(agent.ctx)).toBe(agent.id)
-    expect(context?.identity(ctx)).toBeUndefined()
+    expect(context).toMatchObject({ wire: 'agentId', resource: 'session' })
     expect(context?.resolve(agent.id)).toBe(agent.ctx)
 
-    disposeAgent()
+    await disposeAgent()
     expect(lookup?.resolve(agent.id)).toBeUndefined()
     await agentFiber.dispose()
     expect(ctx.typert.lookups.get('agent')).toBeUndefined()
@@ -174,25 +97,27 @@ describe('AgentRegistry', () => {
 
   it('registers exact entries, emits lifecycle events, and unregisters on owner disposal', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const lifecycle: string[] = []
     ctx.on('agent/created', ({ agent }) => void lifecycle.push(`created:${agent.id}`))
     ctx.on('agent/disposed', ({ agent }) => void lifecycle.push(`disposed:${agent.id}`))
 
     const agent = stubAgent('a1')
-    const dispose = ctx.agents.register(agent)
+    const dispose = await ctx.agents.register(agent)
     expect(ctx.agents.get(agent.id)).toBe(agent)
     expect(ctx.agents.list()).toEqual([agent])
     expect(ctx.agents.roots()).toEqual([agent])
-    expect(() => ctx.agents.register(stubAgent('a1'))).toThrow(/already registered/)
+    await expect(Promise.resolve(ctx.agents.register(stubAgent('a1')))).rejects.toThrow(/already registered/)
 
-    dispose()
+    await dispose()
     expect(ctx.agents.get(agent.id)).toBeUndefined()
     expect(lifecycle).toEqual(['created:a1', 'disposed:a1'])
   })
 
   it('rejects an agent whose registry and session identities differ', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const agent = stubAgent('agent-id', { session: Session.create(SessionId('session-id')) })
 
@@ -203,13 +128,14 @@ describe('AgentRegistry', () => {
 
   it('tracks runtime creator ownership separately from registry order', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const root = stubAgent('root')
     const child = stubAgent('child')
     const detachRoot = ctx.agents.enter(root, undefined)
-    ctx.agents.announce(root)
+    await ctx.agents.announce(root, 'startup')
     const detachChild = ctx.agents.enter(child, root)
-    ctx.agents.announce(child)
+    await ctx.agents.announce(child, 'startup')
 
     expect(ctx.agents.list()).toEqual([root, child])
     expect(ctx.agents.roots()).toEqual([root])
@@ -224,43 +150,76 @@ describe('AgentRegistry', () => {
 
   it('rolls an entry back and pairs a partially delivered creation when a listener throws', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const lifecycle: string[] = []
     ctx.on('agent/created', ({ agent }) => void lifecycle.push(`created:${agent.id}`))
     ctx.on('agent/created', () => { throw new Error('creation veto') })
     ctx.on('agent/disposed', ({ agent }) => void lifecycle.push(`disposed:${agent.id}`))
 
-    expect(() => ctx.agents.register(stubAgent('vetoed'))).toThrow('creation veto')
+    await expect(Promise.resolve(ctx.agents.register(stubAgent('vetoed')))).rejects.toThrow('creation veto')
     expect(ctx.agents.get(SessionId('vetoed'))).toBeUndefined()
     expect(lifecycle).toEqual(['created:vetoed', 'disposed:vetoed'])
   })
 
-  it('contains asynchronous creation rejection and every disposal-listener failure', async () => {
+  it('rolls back asynchronous creation rejection and contains every disposal-listener failure', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const warnings: string[] = []
     const heard: string[] = []
     ctx.logger.warn = ((message: unknown) => { warnings.push(String(message)) }) as typeof ctx.logger.warn
-    ctx.on('agent/created', () => Promise.reject(new Error('created async')) as never)
+    ctx.on('agent/created', () => Promise.reject(new Error('created async')))
+    ctx.on('agent/created', () => { heard.push('unreachable') })
     ctx.on('agent/disposed', () => { throw new Error('disposed sync') })
     ctx.on('agent/disposed', () => Promise.reject(new Error('disposed async')) as never)
     ctx.on('agent/disposed', ({ agent }) => void heard.push(agent.id))
 
-    const dispose = ctx.agents.register(stubAgent('contained'))
-    await Promise.resolve()
-    dispose()
+    await expect(Promise.resolve(ctx.agents.register(stubAgent('contained')))).rejects.toThrow('created async')
     await Promise.resolve()
 
     expect(heard).toEqual(['contained'])
+    expect(ctx.agents.list()).toEqual([])
     expect(warnings).toEqual([
-      'agent "contained": agent/created listener rejected: Error: created async',
       'agent "contained": agent/disposed listener threw: Error: disposed sync',
       'agent "contained": agent/disposed listener rejected: Error: disposed async',
     ])
   })
 
+  it('awaits each creation listener before the next listener and registration completion', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    const entered = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    const order: string[] = []
+    ctx.on('agent/created', async () => {
+      order.push('first:start')
+      entered.resolve(undefined)
+      await release.promise
+      order.push('first:end')
+    })
+    ctx.on('agent/created', () => { order.push('second') })
+    const agent = stubAgent('serial')
+    const registration = ctx.agents.register(agent)
+    const ready = Promise.resolve(registration).then(() => { order.push('ready') })
+    try {
+      await entered.promise
+      expect(order).toEqual(['first:start'])
+      await expect(ctx.agents.announce(agent, 'startup')).rejects.toThrow('already announced')
+      release.resolve(undefined)
+      await ready
+      expect(order).toEqual(['first:start', 'first:end', 'second', 'ready'])
+    } finally {
+      release.resolve(undefined)
+      await registration()
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('separates entry from announcement and stale/idempotent detach cannot remove a replacement', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const lifecycle: string[] = []
     ctx.on('agent/created', ({ agent }) => void lifecycle.push(`created:${agent.id}`))
@@ -269,8 +228,8 @@ describe('AgentRegistry', () => {
     const first = stubAgent('split')
     const detachFirst = ctx.agents.enter(first, undefined)
     expect(lifecycle).toEqual([])
-    ctx.agents.announce(first)
-    expect(() => { ctx.agents.announce(first) }).toThrow(/already announced/)
+    await ctx.agents.announce(first, 'startup')
+    await expect(ctx.agents.announce(first, 'startup')).rejects.toThrow(/already announced/)
     detachFirst()
     detachFirst()
 
@@ -278,13 +237,14 @@ describe('AgentRegistry', () => {
     const detachReplacement = ctx.agents.enter(replacement, undefined)
     detachFirst()
     expect(ctx.agents.get(replacement.id)).toBe(replacement)
-    expect(() => { ctx.agents.announce(first) }).toThrow(/not live/)
+    await expect(ctx.agents.announce(first, 'startup')).rejects.toThrow(/not live/)
     detachReplacement()
     expect(lifecycle).toEqual(['created:split', 'disposed:split'])
   })
 
   it('defers detach requested by a creation listener until that dispatch unwinds', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const order: string[] = []
     const agent = stubAgent('reentrant')
@@ -296,7 +256,7 @@ describe('AgentRegistry', () => {
     ctx.on('agent/created', () => void order.push(`second:${ctx.agents.get(agent.id) === agent}`))
     ctx.on('agent/disposed', () => void order.push('disposed'))
     const detach = ctx.agents.enter(agent, undefined)
-    ctx.agents.announce(agent)
+    await ctx.agents.announce(agent, 'startup')
     expect(order).toEqual(['first:true', 'after-detach:true', 'second:true', 'disposed'])
     expect(ctx.agents.get(agent.id)).toBeUndefined()
   })
@@ -380,6 +340,7 @@ describe('AgentRegistry factory seam', () => {
 
   it('requires a factory and delegates through the calling context', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     await expect(ctx.agents.create({ sessionId: SessionId('s') })).rejects.toThrow(/no agent factory/)
     const { factory, calls } = stubFactory()
@@ -393,10 +354,28 @@ describe('AgentRegistry factory seam', () => {
     }, { inject: ['agents'] }))
     expect(calls.create[0]?.ownerCtx.fiber).toBe(callerFiber)
     expect(calls.resume[0]?.ownerCtx.fiber).toBe(callerFiber)
+    expect(calls.create[0]?.options.parentAgent).toBeUndefined()
+    expect(calls.resume[0]?.options.parentAgent).toBeUndefined()
+  })
+
+  it('keeps the runtime parent in options separately from the caller context', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await ctx.plugin(AgentRegistry)
+    const { factory, calls } = stubFactory()
+    ctx.agents.setFactory(factory)
+    const parent = stubAgent('parent')
+    const unregister = await ctx.agents.register(parent)
+
+    await ctx.agents.create({ sessionId: SessionId('child'), parentAgent: parent })
+
+    expect(calls.create[0]?.options.parentAgent).toBe(parent)
+    await unregister()
   })
 
   it('rejects a second factory and clears the slot with its owner (HMR)', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const owner = await ctx.plugin(Object.assign((inner: Context) => {
       inner.agents.setFactory(stubFactory().factory)
@@ -409,6 +388,7 @@ describe('AgentRegistry factory seam', () => {
 
   it('canonicalizes an already traced Service before tracing it for the caller', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(AgentRegistry)
     const states = new WeakMap<object, string[]>()
     class TracedFactory extends Service implements AgentFactory {

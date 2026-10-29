@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
-import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, parse, resolve } from 'node:path'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -8,7 +8,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import sharp from 'sharp'
 import type { ImageAttachmentLimits } from '@deepseek-ai/dsh-attachment'
 import type { NormalizationPolicy } from '../src/normalization.ts'
-import { commitPreparedImageFile, prepareImageFile, readImageFile, saveImageFile } from '../src/store.ts'
+import {
+  commitPreparedImageFile,
+  prepareImageFile,
+  publishImmutableObject,
+  readImageFile,
+  saveImageFile,
+} from '../src/store.ts'
 
 const fsControl = vi.hoisted(() => ({
   readSignals: [] as AbortSignal[],
@@ -89,12 +95,13 @@ describe('local attachment store', () => {
     // Later directory creation can then stop at that process-proven boundary.
     expect(fsControl.syncedDirectories).toEqual([
       ...parentChainToRoot(base),
-      // bucket chain: every parent entry between the bucket and the boundary.
-      objects,
+      // Staging precedes publication because the streamed digest selects the
+      // target bucket only after every byte has been written.
       storageRoot,
       join(storageRoot, '..'),
       base,
-      // staging chain re-walks the shared ancestors after creating tmp.
+      // bucket chain: every parent entry between the bucket and the boundary.
+      objects,
       storageRoot,
       join(storageRoot, '..'),
       base,
@@ -139,6 +146,29 @@ describe('local attachment store', () => {
     await saveImageFile(storageRoot, { data: PNG, mediaType: 'image/png' }, LIMITS, POLICY)
     if (process.platform !== 'win32') expect((await stat(object)).mode & 0o777).toBe(0o400)
     await expect(readImageFile(storageRoot, first)).resolves.toEqual({ ref: first, data: PNG })
+  })
+
+  it.each([
+    { mediaType: 'image/jpeg' }, { bytes: PNG.byteLength + 1 }, { width: 2 }, { height: 2 },
+  ] as const)('rejects supplied metadata that differs from stored bytes: %j', async (mismatch) => {
+    const storageRoot = await root()
+    const saved = await saveImageFile(storageRoot, { data: PNG, mediaType: 'image/png' }, LIMITS, POLICY)
+    await expect(readImageFile(storageRoot, { ...saved, ...mismatch })).rejects.toMatchObject({ code: 'ATTACHMENT_CORRUPT' })
+  })
+
+  it('preserves supplied display fields while verifying stored image facts', async () => {
+    const storageRoot = await root()
+    const saved = await saveImageFile(storageRoot, { data: PNG, mediaType: 'image/png' }, LIMITS, POLICY)
+    const supplied = { ...saved, name: 'display.png', originalDimensions: { width: 8, height: 8 } }
+    await expect(readImageFile(storageRoot, supplied)).resolves.toEqual({ ref: supplied, data: PNG })
+  })
+
+  it('rejects publication when the supplied digest does not match the staged bytes', async () => {
+    const storageRoot = await root()
+    const target = join(storageRoot, 'objects', '00', 'mismatch')
+    await expect(publishImmutableObject(storageRoot, target, Uint8Array.of(1), '0'.repeat(64)))
+      .rejects.toMatchObject({ code: 'ATTACHMENT_CORRUPT' })
+    expect(await readdir(join(storageRoot, 'tmp'))).toEqual([])
   })
 
   it.skipIf(process.platform !== 'win32')('publishes a new object on Windows', async () => {

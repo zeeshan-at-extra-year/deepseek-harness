@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { constants as bufferConstants } from 'node:buffer'
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, parse, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
@@ -135,6 +135,52 @@ describe('resolve', () => {
   })
 })
 
+describe('home prefix', () => {
+  let home: string
+  beforeEach(async () => {
+    home = await mkdtemp(join(tmpdir(), 'dsh-fs-home-'))
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('USERPROFILE', home)
+    await writeFile(join(home, 'note.txt'), 'home note')
+  })
+  afterEach(async () => {
+    vi.unstubAllEnvs()
+    await rm(home, { recursive: true, force: true })
+  })
+
+  it('resolves and lstats a leading ~ against the home directory', async () => {
+    expect((await fs.resolve('~')).displayPath).toBe(home)
+    const note = await fs.resolve('~/note.txt')
+    expect(note.displayPath).toBe(join(home, 'note.txt'))
+    expect(await fs.readText(note)).toBe('home note')
+    expect((await fs.lstat('~/note.txt'))?.type).toBe('file')
+  })
+
+  it('keeps ~user and later ~ segments relative to cwd', async () => {
+    expect((await fs.resolve('~user/x.txt')).displayPath).toBe(join(dir, '~user', 'x.txt'))
+    expect((await fs.resolve('a/~/b.txt')).displayPath).toBe(join(dir, 'a', '~', 'b.txt'))
+  })
+
+  it.skipIf(process.platform === 'win32')('keeps POSIX ~\\ literal and physical parent traversal after ~/', async () => {
+    expect((await fs.resolve('~\\note.txt')).displayPath).toBe(join(dir, '~\\note.txt'))
+    await mkdir(join(home, 'real', 'sub'), { recursive: true })
+    await writeFile(join(home, 'real', 'a.txt'), 'beside link target')
+    await symlink(join(home, 'real', 'sub'), join(home, 'link'))
+    expect(await fs.readText(await fs.resolve('~/link/../a.txt'))).toBe('beside link target')
+  })
+
+  it.skipIf(process.platform !== 'win32')('expands the Windows ~\\ prefix', async () => {
+    expect((await fs.resolve('~\\note.txt')).displayPath).toBe(join(home, 'note.txt'))
+  })
+
+  it('lists a child literally named ~ under its parent', async () => {
+    await mkdir(join(dir, '~'))
+    const [entry] = await fs.listDir(await fs.resolve('.'))
+    expect(entry?.target.displayPath).toBe(join(dir, '~'))
+    expect(entry?.target.targetKey).toBe(await realpath(join(dir, '~')))
+  })
+})
+
 describe('stat', () => {
   it('returns file metadata, directory type, and undefined for absent', async () => {
     await writeFile(join(dir, 'a.txt'), 'hello')
@@ -167,6 +213,17 @@ describe('stat', () => {
 })
 
 describe('lstat', () => {
+  it.skipIf(process.platform !== 'win32')('uses the same native drive-relative paths as resolve', async () => {
+    await writeFile(join(dir, 'created.txt'), 'native')
+    const drive = parse(dir).root.slice(0, 2)
+    for (const cwd of [dir, `${drive}${relative(process.cwd(), dir)}`]) {
+      for (const path of ['created.txt', `${drive}created.txt`]) {
+        const target = await fs.resolve(path, { cwd })
+        expect(await fs.lstat(path, { cwd })).toEqual(await fs.stat(target))
+      }
+    }
+  })
+
   it('reports path metadata without following the final symlink component', async () => {
     await writeFile(join(dir, 'real.txt'), 'hello')
     await symlink(join(dir, 'real.txt'), join(dir, 'link.txt'))
@@ -305,6 +362,45 @@ describe('readBytes', () => {
     const controller = new AbortController()
     controller.abort()
     await expect(fs.readBytes(await fs.resolve('a.bin'), controller.signal, 1024)).rejects.toMatchObject({ code: 'FS_ABORTED' })
+  })
+})
+
+describe('readByteRange', () => {
+  /** 256 bytes, each equal to its offset. */
+  const ramp = Buffer.from(Array.from({ length: 256 }, (_, i) => i))
+
+  it('reads a window from the middle of a file larger than the window', async () => {
+    await writeFile(join(dir, 'ramp.bin'), ramp)
+    const window = await fs.readByteRange(await fs.resolve('ramp.bin'), { offset: 100, length: 4 }, new AbortController().signal)
+    expect([...window]).toEqual([100, 101, 102, 103])
+  })
+
+  it('shortens a window the file ends inside and empties one at or past the end', async () => {
+    await writeFile(join(dir, 'ramp.bin'), ramp)
+    const target = await fs.resolve('ramp.bin')
+    expect([...await fs.readByteRange(target, { offset: 253, length: 10 })]).toEqual([253, 254, 255])
+    expect((await fs.readByteRange(target, { offset: 256, length: 10 })).length).toBe(0)
+    expect((await fs.readByteRange(target, { offset: 1000, length: 10 })).length).toBe(0)
+  })
+
+  it('returns an empty window for length 0 without touching content', async () => {
+    await writeFile(join(dir, 'ramp.bin'), ramp)
+    expect((await fs.readByteRange(await fs.resolve('ramp.bin'), { offset: 0, length: 0 })).length).toBe(0)
+  })
+
+  it('carries NUL and invalid UTF-8 untouched', async () => {
+    const raw = Buffer.from([0x00, 0xff, 0xfe, 0x41])
+    await writeFile(join(dir, 'a.bin'), raw)
+    expect(Buffer.from(await fs.readByteRange(await fs.resolve('a.bin'), { offset: 0, length: 4 }))).toEqual(raw)
+  })
+
+  it('rejects a missing file, a directory, and an already-aborted signal', async () => {
+    await expect(fs.readByteRange(await fs.resolve('nope'), { offset: 0, length: 1 })).rejects.toMatchObject({ code: 'FS_NOT_FOUND' })
+    await expect(fs.readByteRange(await fs.resolve('.'), { offset: 0, length: 1 })).rejects.toMatchObject({ code: 'FS_NOT_REGULAR_FILE' })
+    await writeFile(join(dir, 'a.bin'), 'data')
+    const controller = new AbortController()
+    controller.abort()
+    await expect(fs.readByteRange(await fs.resolve('a.bin'), { offset: 0, length: 1 }, controller.signal)).rejects.toMatchObject({ code: 'FS_ABORTED' })
   })
 })
 

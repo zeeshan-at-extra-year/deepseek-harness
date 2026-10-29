@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-`dsh-sdk-jsonrpc-server` 通过 stdio 服务 SDK 协议格式，使进程外客户端能够驱动 harness agent（智能体）：它为每个 `sessionId` 打开一个会话、把用户提示词排入队列，并把每个会话事件与 agent 状态转换实时流回客户端。把它作为 `jsonrpc` 插件挂载到 Loader 组合中；外围插件树提供其余一切——agent、模型适配器、持久化与工具。Stdout 只承载 JSON-RPC 帧，因此部署不得组合 stdout logger。它通过 dispose（资源释放）根运行时并以 0 退出应答 `shutdown`；EOF 与信号退出归 app bin 负责。
+`dsh-sdk-jsonrpc-server` 通过 stdio 服务 SDK 协议格式（wire format），使进程外客户端能够驱动 harness agent（智能体）：它为每个 `sessionId` 打开一个会话、把用户提示词排入队列，并把每个会话事件与 agent 状态转换流式发回客户端。把它作为 `jsonrpc` 插件挂载到 Loader 组合中；外围插件树提供其余一切——agent、模型适配器、持久化与工具。Stdout 只承载 JSON-RPC 帧，因此部署不得组合 stdout logger。它通过 dispose（资源释放）根运行时并以 0 退出应答 `shutdown`；EOF 与信号退出归 app bin 负责。
 
 ## 目录
 
@@ -27,15 +27,23 @@ kind: "package-reference"
 
 当运行时必须服务 SDK 客户端时挂载本插件：把它加入组合了 agent 服务的 `cordis.yml`，启动运行时，客户端即可通过 stdio 连接。常用路径是显式的——插件需要 `agents` 服务；其余每个能力都来自外围插件树。
 
+将 `initialize.approvalRequests` 设为 `true`，即可把内部审批作为服务端到客户端的 `approval/request` 请求发送。桥接通过 `agents.isOwnedBy()` 运行时归属识别 SDK 拥有的 Agent 及其仍在运行的进程内后代，持久化的 `parentSession` 历史关系不决定审批归属；其他 Agent，以及未提供该标志的客户端，继续使用已组合的应答链。审批服务仍在分发前执行 `never` 策略，并记录询问与决定的审计事件。桥接仅接受 `allowed-once`、`rejected` 或 `cancelled`；无效响应、客户端错误或传输断开会产生审批服务的拒绝放行结果 `unavailable`。请求取消时释放待处理的协议等待项；shutdown 在等待 Agent 结束前释放所有此类等待项。迟到响应不能授权已放弃的操作。载荷见[协议](../protocol/README.zh.md)，客户端处理见 [Python 示例](../../../python/sdk/README.zh.md#client-approvals)。
+
+`session/resume` 在初始化后接受持久化的 `{ sessionId }`，待其 Agent 就绪后返回 `{}`。它通过 `agents.resume()` 加载历史、修复最后一个被中断的轮次，并保留存储的起始目录和当前有效目录，同时将初始化时选定的模型路由记录为 Session 选择。省略推理强度时，仅在路由相同的情况下保留已保存的显式强度。它不发送新输入。会话缺失、不可读、不兼容或被占用时，请求失败且不创建替代会话。对正在恢复的标识发送提示词时，会等待恢复完成；shutdown 会等待进行中的恢复并释放其 Agent。历史事件保留在日志中，不会作为新通知重新发送。恢复期间记录的模型选择会在恢复响应前发出新的 `session.event` 通知。
+
+插件在注册提醒激活处理方后发布 `sdkSessionActivation` 就绪标记；SDK 组合让 Schedule 依赖此标记，而非 Web Session controller。定时提醒也通过同一个 SDK Session 所有者投递。启动时已到期的提醒等待 SDK 成功初始化，再使用初始化指定的提供方、模型、推理强度和输出上限恢复会话。客户端可以首次接管提醒恢复的 Session；并发的提醒与客户端恢复共用一个 handle。关闭时释放等待初始化的提醒，并等待已经接纳的恢复完成。
+
+`session/working-directory/get` 接收 `{ sessionId }`；`session/working-directory/set` 接收 `{ sessionId, path }`。两者均返回 `{ cwd }`，并可创建未知 Session，而不启动模型轮次。读取通过工作目录服务恢复缺失目录；修改保留起始目录元数据与权限，并通过已记录的用户上下文告知模型。
+
 ### 组装
 
-插件在首次使用时为每个 `sessionId` 创建一个 agent。已注册的模型适配器赢得路由；尚无适配器负责的 `deepseek-official` 路由会挂载 DeepSeek 适配器，任何其他尚无适配器负责的提供方都会导致初始化失败。初始化成功前，所选适配器会解析确切模型与可选推理强度。
+插件在首次使用时为每个 `sessionId` 创建一个 agent。已注册的模型适配器优先用于该路由；尚无适配器负责的 `deepseek-official` 路由会挂载 DeepSeek 适配器，任何其他尚无适配器负责的提供方都会导致初始化失败。初始化成功前，所选适配器会解析确切模型与可选推理强度。
 
 ### 配置
 
 | 字段 | 默认值 | 含义 |
 |---|---|---|
-| `maxTokensAsSuccess` | `false` | 把 max-token 轮次/subagent 终止报告为成功的 SDK 结果 |
+| `maxTokensAsSuccess` | `false` | 把 max-token 轮次或 subagent 终止报告为成功的 SDK 结果 |
 
 profile 组合拥有每个根 agent 的工具。`input`、`output` 与 `exit` 是仅供测试的运行时传输钩子；生产环境使用进程 stdio 与 `process.exit`。生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-sdk-jsonrpc-server)是每个受支持字段的穷尽式真源。
 
@@ -46,6 +54,13 @@ Stdout 只承载 JSON-RPC 帧，客户端可以逐字节解析；诊断信息应
 ### SDK 客户端可以做什么
 
 `initialize` 是运行时就绪边界：服务器由 Loader 组合挂载时，会等待当前插件树完成所有加载任务后再响应，因此首次提示词能够看到 MCP 初始工具发现等异步同级能力。握手返回协议稳定标识 `deepseek-harness-sdk-runtime`。服务器会通过所选适配器校验提供方／模型路由与可选的非空 `reasoningEffort`，再保存这些值；省略时不会保存推理强度，因此模型保留自身默认值。可选的正整数 `maxTokens` 会成为每个 SDK 创建的 agent 及其进程内后代的请求输出上限，省略时则应用所选适配器或提供方路由的默认值。JSON-RPC 请求可能并发分派，因此在一次 `initialize` 成功完成之前，`session/prompt` 会拒绝；客户端必须等待握手完成后再发送提示词。已接受的提示词会把一条带标识的用户消息排入队列，并立即返回 `{ messageId }`；服务器随后把每个持久事实作为 `session.event`、把整个 agent 生命周期的每次状态转换作为 `session.status` 流式发出。它不会把某条助手消息或 `turn/end` 归属于某个提示词，同一会话上的独立请求可以继续排入更多工作。持久化根目录与 persona 来自外围组合。
+
+`session/wait` 观察已有 SDK 会话，直到受管理后代及其触发的根 Agent 后续轮次完成。它拒绝未知或已释放的根 Agent，不会创建会话，并在后代检查期间根 Agent 持续空闲后响应。收件箱消息处于停放状态的空闲子级继续驻留，但不延迟此响应；后续唤醒输入可使其继续运行。完成前发出的会话通知在 stdio 传输上先于响应到达。Agent 的运行时错误会保留在对应的确切会话中，直到后续提交的 `turn/end` 记录结果；否则等待请求会失败，即使错误发生在等待请求之前。终止事件已经记录的错误仍通过会话事件表达，后续成功的活动会清除较早的运行时错误。
+
+<a id="native-user-questions"></a>
+### 原生用户问答
+
+已初始化且声明 `capabilities.userQuestions` 的客户端负责此服务器所拥有的确切根 Agent 的问题。服务器把共享的 `user-questions/request` 事件转为 `user-question/ask` RPC，并在工具或审批消费答案前校验。其他 Agent 和未声明此能力的客户端仍使用原生回答方。工具取消和服务器关闭会中止待决请求并通知宿主；连接失败则返回错误。[协议](../protocol/README.zh.md#native-user-questions)定义载荷结构和错误码。
 
 ### 关闭与退出
 
@@ -63,23 +78,23 @@ Stdout 只承载 JSON-RPC 帧，客户端可以逐字节解析；诊断信息应
 
 ### 设计理念
 
-本插件是薄薄的展示适配器：[`HarnessSdkJsonRpcServer`](src/server.ts) 负责协议方法与通知，传输与具名协议类型来自 `dsh-sdk-protocol`，与客户端 SDK 共享。它订阅会话、agent 与 subagent 生命周期事件，并把它们作为协议通知转发；只有当服务在生命周期建立快照时记录的 `local` 标志为 true 时才转发 subagent 完成事件——提供方名称、子级 id 与持久化谱系均不能证明本地性。
+本插件是轻量的展示适配器：[`HarnessSdkJsonRpcServer`](src/server.ts) 负责协议方法与通知，传输与具名协议类型来自 `dsh-sdk-protocol`，与客户端 SDK 共享。它订阅会话、agent 与 subagent 生命周期事件，并把它们作为协议通知转发；只有当服务在生命周期建立快照时记录的 `local` 标志为 true 时才转发 subagent 完成事件——提供方名称、子级 id 与持久化谱系均不能证明本地性。 `subagent.started` 要求 `origin: subagent` 和直接创建者 ID；普通 fork（包括保留父 ID 的历史会话）不产生此通知。
 
 ### 源码地图
 
 | 文件 | 职责 |
 |---|---|
-| [`src/index.ts`](src/index.ts) | 插件入口：`Config` schema、stdio 接线、请求分发、共享关闭/退出任务 |
+| [`src/index.ts`](src/index.ts) | 插件入口：`Config` schema、stdio 接线、请求分发、共享关闭与退出任务 |
+| [`src/user-questions.ts`](src/user-questions.ts) | 原生问答适配器：宿主转发、答案校验、取消 |
 | [`src/server.ts`](src/server.ts) | `HarnessSdkJsonRpcServer`：协议方法、逐会话 agent 创建、生命周期订阅、清理 |
-| — | 不发布运行时不变式伴生入口；边界与回放测试覆盖协议映射。 |
 
 ### 请求流程
 
-每个协议方法在行动前都会校验输入并解析其拥有的状态——`initialize` 保存 SDK 路由，`session/prompt` 解析存活的 agent+会话对并排入消息，`shutdown` 在刷新响应并以 0 退出前把服务器持有的状态 dispose 到完全停稳——共享退出任务确保竞争的 shutdown 请求绝不会重复 dispose 或退出。分发逻辑位于 [src/index.ts](src/index.ts) 与 [src/server.ts](src/server.ts)。
+每个协议方法在执行前都会校验输入并解析负责该请求的状态——`initialize` 保存 SDK 路由，`session/prompt` 解析存活的 agent 与会话配对并排入消息，`shutdown` 刷新响应，再 dispose 根上下文使其达到完全停稳，最后以 0 退出——共享退出任务确保竞争的 `shutdown` 请求绝不会重复 dispose 或退出。分发逻辑位于 [src/index.ts](src/index.ts) 与 [src/server.ts](src/server.ts)。
 
 ### 清理
 
-`server.shutdown()` 只 dispose 服务器自身持有的内容——仅卸载本插件时，外围上下文保持运行。协议 `shutdown` 则 dispose 根 fiber，使持久化与整个运行时在进程退出前达到完全停稳。
+`server.shutdown()` 关闭其精确根 Agent 下的后代准入，按子级优先顺序排空托管后代，再释放根句柄与适配器。它移除自身订阅，而仅卸载本插件时，无关父级树与外围上下文保持运行。后代排空失败会在其余根句柄与适配器的清理完成后报告。协议 `shutdown` 则 dispose 根 fiber，使持久化与整个运行时在进程退出前达到完全停稳。
 
 </details>
 
@@ -133,6 +148,6 @@ Stdout 只承载 JSON-RPC 帧，客户端可以逐字节解析；诊断信息应
 <details>
 <summary>维护者的工作上下文——点击展开</summary>
 
-本开发备注是维护者的工作上下文，明确不具权威性——已交付的行为与限制见上文各节与代码。单文件可执行运行时分发将本插件与打包的 `jsonrpc-demo` bin 配对；请让关闭/退出约定与负责 EOF 和信号退出的 app bin 保持一致。没有记录其他未解决的开放设计问题。
+本开发备注是维护者的工作上下文，明确不具权威性——已交付的行为与限制见上文各节与代码。单文件可执行运行时分发将本插件与打包的 `jsonrpc-demo` bin 配对；请让关闭与退出约定与负责 EOF 和信号退出的 app bin 保持一致。没有记录其他未解决的开放设计问题。
 
 </details>

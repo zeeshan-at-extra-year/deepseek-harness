@@ -30,10 +30,19 @@
       "path": "../../client/connection/tsconfig.host.json"
     },
     {
+      "path": "../../client/file-upload/tsconfig.host.json"
+    },
+    {
       "path": "../../host/webserver"
     },
     {
       "path": "../../util/crypto"
+    },
+    {
+      "path": "../../client/web"
+    },
+    {
+      "path": "../../boot/app-boot"
     }
   ]
 }

@@ -1,7 +1,7 @@
 /** Shared trajectory record data and formatting contracts. */
 
 import type { HTMLAttributes } from 'react'
-import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
+import type { FileAttachmentRef, ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
 import type { ConversationPromptSnapshot } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { TrajectoryTranslate } from './locales.ts'
 
@@ -30,6 +30,8 @@ export interface TrajectorySourceBlock {
   type: string
   content: string
   attachment?: ImageAttachmentRef
+  /** Ordinary file metadata; never passed to the image loader. */
+  file?: FileAttachmentRef
   callId?: string
   toolName?: string
 }
@@ -58,10 +60,14 @@ export interface TrajectoryCellProps extends HTMLAttributes<HTMLDivElement> {
   inputDetail?: string
   /** Complete system-prompt/tool-catalog state introduced by a SYSTEM record. */
   promptDetail?: ConversationPromptSnapshot
+  /** Known prompt text without a loaded request config or tool catalog. */
+  systemPromptDetail?: string
   /** System-prompt/tool-catalog state replaced by a SYSTEM update. */
   previousPromptDetail?: ConversationPromptSnapshot
   /** Full assistant/tool result content for the details panel. */
   outputDetail?: string
+  /** Committed result event used to inspect a live-only value. */
+  resultSeq?: number
   /** Full assistant reasoning content for the details panel. */
   thinkingDetail?: string
   /** Original message blocks in source order for the details panel. */
@@ -78,7 +84,9 @@ export interface TrajectoryCellProps extends HTMLAttributes<HTMLDivElement> {
   resultPreviewMarkdown?: string
   /** Tool call id used to link message source blocks to tool records. */
   callId?: string
-  /** Tool-only result failure state. */
+  /** Recorded tool name; independent of the display summary. */
+  toolName?: string
+  /** Failed operation or interrupted assistant output. */
   isError?: boolean
   /** Own duration in seconds, or `null` when no duration is known. */
   timeSeconds: number | null

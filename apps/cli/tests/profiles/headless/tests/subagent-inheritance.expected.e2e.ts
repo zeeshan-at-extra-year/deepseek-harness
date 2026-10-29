@@ -3,20 +3,28 @@
  * its child log and confines a real write under a wider deployment default.
  */
 
-import { readFile, readdir, writeFile } from 'node:fs/promises'
+import { readFile, readdir, realpath, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
-import { normalizeSessionSnapshot, type NormalizeContext } from '@deepseek-ai/dsh-session-snapshot'
+import {
+  fixtureContext,
+  normalizeSessionSnapshot,
+  normalizeSessionSnapshots,
+  REPLAY_CREDENTIAL_ENV,
+  type NormalizeContext,
+} from '@deepseek-ai/dsh-session-snapshot'
 import { LOADER_SMOKE_TEST_TIMEOUT_MS, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
-import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { createMessage, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, SESSION_FORMAT_VERSION, SessionId, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import { describe, expect, it } from 'vitest'
 
 const fixtureDir = fileURLToPath(new URL('./expected/subagent-inheritance', import.meta.url))
 const replayOverride = join(fixtureDir, 'replay.override.json')
-const childReplay = join(fixtureDir, 'child.replay.jsonl')
+// The released V3 child fixture replays through the V3-to-V4 migration, so its
+// tool results lift and its plugin sources move onto producer kinds.
+const childReplay = join(fixtureDir, 'child.replay.v3.jsonl')
 const parentExpected = join(fixtureDir, 'parent.expected.jsonl')
 const childExpected = join(fixtureDir, 'child.expected.jsonl')
 const configPath = fileURLToPath(new URL('../subagent-inheritance-snapshot.patch.yml', import.meta.url))
@@ -25,6 +33,16 @@ const tsconfigPath = fileURLToPath(new URL('../../../../../../tsconfig.json', im
 const sessionId = SessionId('subagent-inheritance-parent')
 const refreshing = process.env.DSH_SNAPSHOT === 'refresh'
 const task = 'Delegate the write probe to a subagent.'
+
+/** Compare current normalized Session records without historical migration. */
+async function expectSession(actual: string, expectedPath: string): Promise<void> {
+  const expected = await readFile(expectedPath, 'utf8')
+  const parse = (content: string): Record<string, unknown>[] => content.split('\n')
+    .filter(line => line.trim().length > 0)
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  expect(normalizeSessionSnapshots([actual], fixtureContext(actual)).map(parse))
+    .toEqual(normalizeSessionSnapshots([expected], fixtureContext(expected)).map(parse))
+}
 
 /** Seed a completed parent turn with its read-only policy and current LLM selection. */
 async function seedReadOnlyParent(root: string, cwd: string): Promise<void> {
@@ -40,12 +58,18 @@ async function seedReadOnlyParent(root: string, cwd: string): Promise<void> {
   }
   const events: SessionEvent[] = [
     { type: 'turn/start', seq: SessionSeq(0), time: 10, data: { turn: 1 } },
-    { type: 'user/message', seq: SessionSeq(1), time: 11, data: createUserMessage({ content: [{ type: 'text', text: 'Tighten this session to read-only.' }], source: { kind: 'user' } }), surfaceOp: 'append' },
-    { type: 'sandbox/mode', seq: SessionSeq(2), time: 12, data: { mode: 'read-only' } },
+    { type: 'step/start', seq: SessionSeq(1), time: 11, data: { turn: 1, step: 1 } },
+    {
+      type: 'system/message', seq: SessionSeq(2), time: 12,
+      data: { turn: 1, step: 1, message: createMessage({ role: 'system', content: [], source: { kind: 'system-prompt' } }) },
+      surfaceOp: 'append',
+    },
+    { type: 'user/message', seq: SessionSeq(3), time: 13, data: createUserMessage({ content: [{ type: 'text', text: 'Tighten this session to read-only.' }], source: { kind: 'user' } }), surfaceOp: 'append' },
+    { type: 'sandbox/mode', seq: SessionSeq(4), time: 14, data: { mode: 'read-only' } },
     {
       type: 'request/header',
-      seq: SessionSeq(3),
-      time: 13,
+      seq: SessionSeq(5),
+      time: 15,
       data: {
         header: {
           config: {
@@ -57,7 +81,8 @@ async function seedReadOnlyParent(root: string, cwd: string): Promise<void> {
         reason: 'initial',
       },
     },
-    { type: 'turn/end', seq: SessionSeq(4), time: 14, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'step/end', seq: SessionSeq(6), time: 16, data: { turn: 1, step: 1 } },
+    { type: 'turn/end', seq: SessionSeq(7), time: 17, data: { turn: 1, reason: { kind: 'completed' } } },
   ]
   try {
     const handle = await ctx.sessionPersistence.create(meta)
@@ -80,6 +105,7 @@ describe('parent-only override inheritance snapshot', () => {
       binArgs: [configPath, task],
       tsconfigPath,
       env: {
+        ...REPLAY_CREDENTIAL_ENV,
         // The primary fixture path must exist for llm-replay's config guard;
         // the override sidecar fully replaces the derived parent script.
         DSH_SNAPSHOT_FILE: replayOverride,
@@ -87,8 +113,8 @@ describe('parent-only override inheritance snapshot', () => {
         DSH_SNAPSHOT_CHILD_FILES: childReplay,
       },
       prepare: async (runCwd) => {
-        cwd = runCwd
-        await seedReadOnlyParent(join(runCwd, '.sessions'), runCwd)
+        cwd = await realpath(runCwd)
+        await seedReadOnlyParent(join(cwd, '.sessions'), cwd)
       },
       inspect: async (runCwd) => {
         // THE physical fact: the child's write never reached the disk. Under
@@ -108,20 +134,20 @@ describe('parent-only override inheritance snapshot', () => {
         const childRecords = child.trimEnd().split('\n').map(
           line => JSON.parse(line) as Record<string, unknown>,
         )
-        expect(childRecords[1]).toMatchObject({
+        expect(childRecords.find(record => record.type === 'sandbox/mode')).toMatchObject({
           type: 'sandbox/mode',
-          seq: SessionSeq(0),
           data: { mode: 'read-only', source: 'delegation' },
         })
+        expect(childRecords.findIndex(record => record.type === 'sandbox/mode'))
+          .toBeLessThan(childRecords.findIndex(record => record.type === 'turn/start'))
 
         const runtimeContexts = (content: string): string[] => content.trimEnd().split('\n').flatMap((line) => {
           const record = JSON.parse(line) as {
             type?: string
-            data?: { source?: { kind?: string; plugin?: string }; content?: Array<{ type?: string; text?: unknown }> }
+            data?: { source?: { kind?: string }; content?: Array<{ type?: string; text?: unknown }> }
           }
           if (record.type !== 'user/message'
-            || record.data?.source?.kind !== 'plugin'
-            || record.data.source.plugin !== '@deepseek-ai/dsh-system-prompt') return []
+            || record.data?.source?.kind !== 'runtime-context') return []
           return record.data.content?.flatMap(block => block.type === 'text' && typeof block.text === 'string' ? [block.text] : []) ?? []
         })
         const policyContexts = [...runtimeContexts(parent), ...runtimeContexts(child)]
@@ -141,8 +167,8 @@ describe('parent-only override inheritance snapshot', () => {
           await writeFile(parentExpected, normalizedParent)
           await writeFile(childExpected, normalizedChild)
         }
-        expect(normalizedParent).toBe(await readFile(parentExpected, 'utf8'))
-        expect(normalizedChild).toBe(await readFile(childExpected, 'utf8'))
+        await expectSession(normalizedParent, parentExpected)
+        await expectSession(normalizedChild, childExpected)
         // The child's real write was denied by the real fence.
         expect(normalizedChild).toContain('file access denied under read-only mode')
       },

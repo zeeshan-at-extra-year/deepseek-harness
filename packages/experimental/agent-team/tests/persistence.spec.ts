@@ -8,14 +8,14 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
-import SubagentService, { seedDescriptorTurn, snapshotSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
+import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import SubagentService, { snapshotSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import { MockAdapter, textResponse } from '../../../core/agent-loop/tests/mock-adapter.ts'
+import { mountWorkingDirectoryFixture } from '../../../subagent/subagent/tests/working-directory-fixture.ts'
 import TeamService, { TeamId, TeamMessageId } from '../src/index.ts'
+import { readPersistedSession } from '../src/persisted.ts'
 import { teamProjectionDefinition } from '../src/projection.ts'
 import type { TeamMemberSnapshot, TeamMessageSnapshot, TeamTaskSnapshot } from '../src/index.ts'
 import { TestSessionQuery } from './test-session-query.ts'
@@ -27,9 +27,9 @@ const contexts = new Set<Context>()
 
 /** Detached durable Team read through the same projection definition as the service. */
 function durable(agent: Agent): {
-  members: TeamMemberSnapshot[]
-  tasks: TeamTaskSnapshot[]
-  pendingMessages: TeamMessageSnapshot[]
+  members: readonly TeamMemberSnapshot[]
+  tasks: readonly TeamTaskSnapshot[]
+  pendingMessages: readonly TeamMessageSnapshot[]
 } {
   let projected = teamProjectionDefinition.init(agent.session.header)
   for (const event of agent.session.snapshotEvents()) projected = teamProjectionDefinition.apply(projected, event)
@@ -46,7 +46,7 @@ function durable(agent: Agent): {
 async function storedEvents(ctx: Context, id: SessionId): Promise<readonly SessionEvent[]> {
   const handle = await ctx.sessionPersistence.open(id, 'read')
   try {
-    return await handle.read()
+    return (await handle.read()).events
   } finally {
     await handle.close()
   }
@@ -102,7 +102,7 @@ async function stack(
   const ctx = new Context()
   contexts.add(ctx)
   await mountAgentLoopTestDependencies(ctx)
-  await ctx.plugin(SessionProjectionRegistry)
+  await mountWorkingDirectoryFixture(ctx)
   await backend.mount(ctx, root)
   await ctx.plugin(TestSessionQuery)
   await ctx.plugin(AgentLoop, { agents: [] })
@@ -135,17 +135,17 @@ async function persistedChild(
   childId: SessionId,
   message: ReturnType<typeof createUserMessage>,
 ) {
-  const seed = seedDescriptorTurn(childId, undefined, snapshotSubagentDescriptor({
+  const descriptor = snapshotSubagentDescriptor({
     mode: 'continuable',
     provider: 'spawn',
     label: 'persisted child fixture',
     agentProvider: 'mock',
     agentModel: 'mock',
-  }))
+  })
   const child = ctx.sessions.create(childId, {
-    seed,
     meta: { parentSession: rootId, origin: 'subagent' },
   })
+  child.append('subagent/descriptor', descriptor)
   child.append('agent/inbox/spliced', {
     target: 'next-turn',
     start: 0,
@@ -161,6 +161,40 @@ async function persistedChild(
 
 for (const backend of backends) {
   describe(`${backend.name} Agent Teams recovery`, () => {
+    it('restores a directly accepted target inbox from its flushed crash prefix without Team intent', async () => {
+      const liveRoot = mkdtempSync(join(tmpdir(), 'dsh-team-live-'))
+      const crashRoot = mkdtempSync(join(tmpdir(), 'dsh-team-crash-'))
+      roots.push(liveRoot, crashRoot)
+      const first = await stack(backend, liveRoot, ['hang'])
+      const lead = await first.ctx.agentLoop.create(SessionId('direct-root'), { provider: 'mock', model: 'mock' })
+      const target = await first.ctx.agentTeams.spawnTeammate(lead, {
+        name: 'worker', description: 'pending inbox recovery', prompt: [{ type: 'text', text: 'initial' }],
+        context: 'fresh', provider: 'spawn', signal: SIGNAL,
+      })
+      const child = first.ctx.agents.get(target.member.id)!
+      const receipt = await first.ctx.agentTeams.sendMessage(lead, {
+        target: 'worker', content: [{ type: 'text', text: 'accepted before crash' }], signal: SIGNAL,
+      })
+      await first.ctx.sessions.flush(child.session)
+      const prefix = await readPersistedSession(first.ctx.sessionPersistence, child.id, SIGNAL)
+      expect(prefix.events.some(event => event.type === 'agent/inbox/spliced'
+        && event.data.inserted.some(message => message.id === receipt.messageId))).toBe(true)
+      expect(lead.session.snapshotEvents().some(event => event.type.startsWith('team/message/'))).toBe(false)
+      await first.dispose()
+      const second = await stack(backend, crashRoot, [textResponse('recovered')])
+      const writer = await second.ctx.sessionPersistence.create(prefix.header)
+      try { await writer.append(prefix.events) } finally { await writer.close() }
+      const resumed = await second.ctx.agents.resume({
+        resumeSessionId: child.id, agentOptions: { provider: 'mock', model: 'mock' },
+      })
+      expect(resumed.agent.inbox.nextStep.find(message => message.id === receipt.messageId)).toMatchObject({
+        source: { kind: 'agent-message', form: 'relay', senderSessionId: lead.id },
+        content: [{ type: 'text', text: 'Team message from lead:' }, { type: 'text', text: 'accepted before crash' }],
+      })
+      await resumed.dispose()
+      await second.dispose()
+    })
+
     it('reconciles a persisted child to active and a missing child to durable failed', {
       timeout: PERSISTENCE_TEST_TIMEOUT_MS,
     }, async () => {
@@ -191,7 +225,8 @@ for (const backend of backends) {
         first.ctx.sessions.flush(activeRoot.session),
         first.ctx.sessions.flush(failedRoot.session),
       ])
-      await first.ctx.subagents.startContinuable({
+      await first.ctx.subagents.startActivation({
+        delivery: 'parent',
         childId,
         provider: 'spawn',
         label: 'recoverable recovery',
@@ -227,7 +262,7 @@ for (const backend of backends) {
         content: [{ type: 'text', text: 'resume after reconciliation' }],
         signal: SIGNAL,
       })
-      expect(receipt.status).toBe('accepted')
+      expect(receipt.messageId).toEqual(expect.any(String))
       await vi.waitFor(() => { expect(second.ctx.agents.get(childId)).toBeUndefined() }, { timeout: 5_000 })
       await vi.waitFor(() => { expect(durable(activeHandle.agent).pendingMessages).toEqual([]) })
 
@@ -277,7 +312,7 @@ for (const backend of backends) {
       await second.dispose()
     })
 
-    it('retries queued mail through cold-resume Steer after restart', {
+    it('keeps historical queued mail readable without delivering it after restart', {
       timeout: PERSISTENCE_TEST_TIMEOUT_MS,
     }, async () => {
       const storageRoot = mkdtempSync(join(tmpdir(), `dsh-team-mail-${backend.name.toLowerCase()}-`))
@@ -288,100 +323,19 @@ for (const backend of backends) {
       const firstLead = await first.ctx.agentLoop.create(rootId, { provider: 'mock', model: 'mock' })
       const started = await first.ctx.agentTeams.spawnTeammate(firstLead, {
         name: 'mail-worker',
-        description: 'mail recovery worker',
+        description: 'historical mailbox target',
         prompt: [{ type: 'text', text: 'finish before restart' }],
         context: 'fresh',
         provider: 'spawn',
         signal: SIGNAL,
       })
       await vi.waitFor(() => { expect(first.ctx.agents.get(started.member.id)).toBeUndefined() }, { timeout: 5_000 })
-      vi.spyOn(first.ctx.sessionPersistence, 'open')
-        .mockRejectedValueOnce(new Error('temporary target read failure'))
-      const queued = await first.ctx.agentTeams.sendMessage(firstLead, {
-        target: 'mail-worker',
-        content: [{ type: 'text', text: 'durable retry context' }],
-        signal: SIGNAL,
-      })
-      expect(queued.status).toBe('queued')
-      expect(durable(firstLead).pendingMessages.map(message => message.id)).toEqual([queued.messageId])
-      await first.dispose()
-
-      const second = await stack(backend, storageRoot, [textResponse('resumed teammate answer')])
-      const rootHandle = await second.ctx.agents.resume({
-        resumeSessionId: rootId,
-        agentOptions: { provider: 'mock', model: 'mock' },
-      })
-      await vi.waitFor(() => { expect(second.ctx.agents.get(started.member.id)).toBeUndefined() }, { timeout: 5_000 })
-      await vi.waitFor(() => { expect(durable(rootHandle.agent).pendingMessages).toEqual([]) })
-
-      const child = await storedEvents(second.ctx, started.member.id)
-      const peerIds = child.flatMap(event => event.type === 'user/message'
-        && event.data.source.kind === 'team-message'
-        ? [event.data.source.messageId]
-        : [])
-      expect(peerIds).toEqual([queued.messageId])
-
-      await rootHandle.dispose()
-      await second.dispose()
-    })
-
-    it('acknowledges target-recorded mail after restart without delivering it twice', {
-      timeout: PERSISTENCE_TEST_TIMEOUT_MS,
-    }, async () => {
-      const storageRoot = mkdtempSync(join(tmpdir(), `dsh-team-dedup-${backend.name.toLowerCase()}-`))
-      roots.push(storageRoot)
-      const rootId = SessionId(`${backend.name.toLowerCase()}-dedup-root`)
-      const messageId = TeamMessageId(`${backend.name.toLowerCase()}-recorded-message`)
-
-      const first = await stack(backend, storageRoot, [textResponse('initial teammate answer')])
-      const firstLead = await first.ctx.agentLoop.create(rootId, { provider: 'mock', model: 'mock' })
-      const started = await first.ctx.agentTeams.spawnTeammate(firstLead, {
-        name: 'dedup-worker',
-        description: 'mail deduplication worker',
-        prompt: [{ type: 'text', text: 'finish before the crash window' }],
-        context: 'fresh',
-        provider: 'spawn',
-        signal: SIGNAL,
-      })
-      await vi.waitFor(() => { expect(first.ctx.agents.get(started.member.id)).toBeUndefined() }, { timeout: 5_000 })
-
-      const targetHandle = await first.ctx.agents.resume({
-        resumeSessionId: started.member.id,
-        agentOptions: { provider: 'mock', model: 'mock' },
-      })
-      targetHandle.agent.session.append('user/message', createUserMessage({
-        content: [
-          { type: 'text', text: `Team message ${messageId} from lead:` },
-          { type: 'text', text: 'already recorded before acknowledgement' },
-        ],
-        source: {
-          kind: 'team-message',
-          teamId: TeamId(rootId),
-          messageId,
-          senderId: rootId,
-          senderName: 'lead',
-        },
-      }), { surfaceOp: 'append' })
-      await first.ctx.sessions.flush(targetHandle.agent.session)
-      // Let the pre-queue acknowledgement observer prove there is no mailbox
-      // row yet before authoring the simulated crash prefix below.
-      await new Promise<void>((resolve) => { setTimeout(resolve, 0) })
-      await targetHandle.dispose()
-
-      const queued: TeamMessageSnapshot = {
-        id: messageId,
-        senderId: rootId,
-        senderName: 'lead',
-        targetId: started.member.id,
-        content: [{ type: 'text', text: 'already recorded before acknowledgement' }],
+      const message = {
+        id: TeamMessageId('legacy-pending'), senderId: rootId, senderName: 'lead', targetId: started.member.id,
+        content: [{ type: 'text' as const, text: 'historical pending context' }],
       }
-      firstLead.session.append('team/message/queued', {
-        version: 2,
-        teamId: TeamId(rootId),
-        message: queued,
-      })
+      firstLead.session.append('team/message/queued', { version: 2, teamId: TeamId(rootId), message })
       await first.ctx.sessions.flush(firstLead.session)
-      expect(durable(firstLead).pendingMessages.map(message => message.id)).toEqual([messageId])
       await first.dispose()
 
       const second = await stack(backend, storageRoot, [])
@@ -389,89 +343,12 @@ for (const backend of backends) {
         resumeSessionId: rootId,
         agentOptions: { provider: 'mock', model: 'mock' },
       })
-      await vi.waitFor(() => { expect(durable(rootHandle.agent).pendingMessages).toEqual([]) })
+      expect(durable(rootHandle.agent).pendingMessages).toEqual([message])
       expect(second.ctx.agents.get(started.member.id)).toBeUndefined()
-      expect(second.adapter.requests).toEqual([])
-
       const child = await storedEvents(second.ctx, started.member.id)
-      const occurrences = child.filter(event => event.type === 'user/message'
-        && event.data.source.kind === 'team-message'
-        && event.data.source.messageId === messageId)
-      expect(occurrences).toHaveLength(1)
-
-      await rootHandle.dispose()
-      await second.dispose()
-    })
-
-    it('acknowledges durably pending target mail without cold-resume duplication', {
-      timeout: PERSISTENCE_TEST_TIMEOUT_MS,
-    }, async () => {
-      const storageRoot = mkdtempSync(join(tmpdir(), `dsh-team-inbox-${backend.name.toLowerCase()}-`))
-      roots.push(storageRoot)
-      const rootId = SessionId(`${backend.name.toLowerCase()}-inbox-root`)
-      const childId = SessionId(`${backend.name.toLowerCase()}-inbox-child`)
-      const messageId = TeamMessageId(`${backend.name.toLowerCase()}-pending-team-message`)
-      const first = await stack(backend, storageRoot, [])
-      const root = await first.ctx.agentLoop.create(rootId, { provider: 'mock', model: 'mock' })
-      await Promise.resolve()
-      await Promise.resolve()
-      const provisioned = provisioning(childId, 'pending-mail-worker')
-      const active: TeamMemberSnapshot = {
-        ...provisioned,
-        phase: 'active',
-      }
-      const queued: TeamMessageSnapshot = {
-        id: messageId,
-        senderId: rootId,
-        senderName: 'lead',
-        targetId: childId,
-        content: [{ type: 'text', text: 'already durable in target inbox' }],
-      }
-      root.session.append('team/member', {
-        version: 2,
-        teamId: TeamId(root.id),
-        member: provisioned,
-      })
-      root.session.append('team/member', {
-        version: 2,
-        teamId: TeamId(root.id),
-        member: active,
-      })
-      root.session.append('team/message/queued', {
-        version: 2,
-        teamId: TeamId(root.id),
-        message: queued,
-      })
-      const pending = createUserMessage({
-        content: [{ type: 'text', text: 'already durable in target inbox' }],
-        source: {
-          kind: 'team-message',
-          teamId: TeamId(rootId),
-          messageId,
-          senderId: rootId,
-          senderName: 'lead',
-        },
-      })
-      await persistedChild(first.ctx, rootId, childId, pending)
-      await first.ctx.sessions.flush(root.session)
-      await first.dispose()
-
-      const second = await stack(backend, storageRoot, [])
-      const rootHandle = await second.ctx.agents.resume({
-        resumeSessionId: rootId,
-        agentOptions: { provider: 'mock', model: 'mock' },
-      })
-      await vi.waitFor(() => {
-        expect(durable(rootHandle.agent).pendingMessages).toEqual([])
-      })
+      expect(child.some(event => event.type === 'user/message'
+        && event.data.source.kind === 'team-message')).toBe(false)
       expect(second.adapter.requests).toEqual([])
-      expect(second.ctx.agents.get(childId)).toBeUndefined()
-      const stored = await storedEvents(second.ctx, childId)
-      const pendingCopies = stored.flatMap(event => event.type === 'agent/inbox/spliced'
-        ? event.data.inserted.filter(message => message.source.kind === 'team-message'
-          && message.source.messageId === messageId)
-        : [])
-      expect(pendingCopies).toHaveLength(1)
 
       await rootHandle.dispose()
       await second.dispose()

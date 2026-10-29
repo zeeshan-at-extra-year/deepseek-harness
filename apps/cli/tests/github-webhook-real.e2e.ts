@@ -4,16 +4,17 @@ import type { ChildProcess } from 'node:child_process'
 import { spawn } from 'node:child_process'
 import { createHmac, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import { decodeStorageRecord } from '@deepseek-ai/dsh-session/chunk-rows'
 import { describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
+import { initProfile } from '@deepseek-ai/dsh-app-boot'
+import { PROFILE_TEMPLATES } from '@deepseek-ai/dsh-official-bundles'
 
 const REPO_ROOT = fileURLToPath(new URL('../../..', import.meta.url))
 const BUILT_BIN = join(REPO_ROOT, 'apps/cli/lib/bin.js')
@@ -60,21 +61,13 @@ interface WorkspaceBaseline {
 }
 
 interface HistoryPage {
-  records: Array<
-    | { type: 'event'; event: HistoryEvent }
-    | { type: 'chunks'; event: HistoryChunkEvent }
-  >
+  records: Array<{ type: 'event'; event: HistoryEvent }>
   hasMore: boolean
 }
 
 interface HistoryEvent {
   type: string
   data: unknown
-}
-
-interface HistoryChunkEvent extends HistoryEvent {
-  seq: number
-  time: number
 }
 
 interface ProcessObservation {
@@ -314,16 +307,9 @@ function assistantText(page: HistoryPage): string {
   return text.join('\n')
 }
 
-/** Expand lossless history records for assertions over the public event stream. */
+/** Read scalar v2 history records for assertions over the public event stream. */
 function historyEvents(page: HistoryPage): HistoryEvent[] {
-  return page.records.flatMap(record => record.type === 'event'
-    ? [record.event]
-    : decodeStorageRecord({
-      type: record.event.type.replace(/^chunkrow\//u, ''),
-      seq0: record.event.seq,
-      time0: record.event.time,
-      data: record.event.data,
-    }))
+  return page.records.map(record => record.event)
 }
 
 /** Stop the spawned CLI through its normal signal path, escalating only on a stuck teardown. */
@@ -343,10 +329,10 @@ async function sendGitHubDelivery(origin: string): Promise<Response> {
   const body = JSON.stringify({
     action: 'ready_for_review',
     number: 4242,
-    repository: { full_name: 'deepseek-harness/deepseek-harness' },
+    repository: { full_name: 'deepseek-ai/deepseek-harness' },
     pull_request: {
       title: 'Real CLI webhook e2e',
-      html_url: 'https://github.com/deepseek-harness/deepseek-harness/pull/4242',
+      html_url: 'https://github.com/deepseek-ai/deepseek-harness/pull/4242',
       draft: false,
       user: { login: 'octocat' },
       base: { ref: 'master', sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' },
@@ -373,6 +359,18 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('GitHub webhook through the real 
     const workspacePath = join(root, 'workspace')
     await mkdir(workspacePath)
     const canonicalWorkspacePath = await realpath(workspacePath)
+    const profile = join(root, '.dsh/profiles/web')
+    initProfile(profile, PROFILE_TEMPLATES.web!.bundles)
+    const manifestPath = join(profile, 'package.json')
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as { dependencies: Record<string, string> }
+    for (const name of ['@deepseek-ai/dsh-webhook', '@deepseek-ai/dsh-webhook-github']) {
+      const directory = dirname(fileURLToPath(import.meta.resolve(`${name}/package.json`)))
+      const link = join(profile, 'node_modules', name)
+      await mkdir(dirname(link), { recursive: true })
+      await symlink(directory, link, 'junction')
+      manifest.dependencies[name] = `file:${directory}`
+    }
+    await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
     const webhookPort = await freePort()
     const child = spawn(process.execPath, [
       BUILT_BIN,
@@ -428,7 +426,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('GitHub webhook through the real 
       const admitted = await eventually(
         child,
         observation.text,
-        'webhook provenance, title, and permission events',
+        'webhook source, title, and permission events',
         async () => await history(baseUrl, sessionId),
         (page) => {
           const events = historyEvents(page)

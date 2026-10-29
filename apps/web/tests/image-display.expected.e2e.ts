@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 // Multimodal image surfaces over the BUILT client graph (the ptc-fixture
-// idiom: real bundles via AppWebEntry, keyless fixture Connection RPC).
+// idiom: real bundles via AppWebEntry, keyless RemoteMock transport).
 // Opens the fixture history session whose turn 73 carries an image in BOTH a
 // user message and an assistant message, and pins the product surfaces: the
 // history ImageGallery loading real fixture bytes through the authorized
@@ -8,7 +8,7 @@
 // intake chain (paste → ordered thumbnail rail → image-only send enablement → remove).
 import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { expect, it } from 'vitest'
-import { installAssembledBootEnv, mountAssembledApp } from './assembled-boot.ts'
+import { createAssembledSessionComposer, installAssembledBootEnv, mountAssembledApp } from './assembled-boot.ts'
 
 installAssembledBootEnv()
 
@@ -79,22 +79,11 @@ it('renders the history image pair through the authorized attachment route and o
 })
 
 it('accepts pasted images into the composer rail in order and removes them', async () => {
-  mountAssembledApp()
-
-  const tree = await screen.findByRole('tree', { name: 'Sessions' }, { timeout: 10_000 })
-  const start = tree.querySelector<HTMLButtonElement>('button[aria-label="New session in fixture"]')
-  if (start === null) throw new Error('fixture Workspace new-session action missing')
-  fireEvent.click(start)
+  const remote = mountAssembledApp()
 
   // Image-only send arming is pinned at package level (input-bar.spec.tsx);
   // this assembled lane pins the intake chain over the built graph.
-  const textarea = await waitFor(() => {
-    const surface = document.querySelector<HTMLElement>(
-      '[data-composer-input][data-placeholder="Describe what you want to build... / commands, @ files or sessions"]',
-    )
-    if (surface === null) throw new Error('composer surface missing')
-    return surface
-  }, { timeout: 10_000 })
+  const textarea = await createAssembledSessionComposer(remote)
   const image = new File([new Uint8Array([137, 80, 78, 71])], 'pasted.png', { type: 'image/png' })
   fireEvent.paste(textarea, {
     clipboardData: {
@@ -106,7 +95,7 @@ it('accepts pasted images into the composer rail in order and removes them', asy
   // The rail is an accessible group holding the draft thumbnail (queried via
   // DOM: jsdom's a11y-visibility computation hides the composer subtree).
   const rail = await waitFor(() => {
-    const el = document.querySelector('[role="group"][aria-label="Pending images"]')
+    const el = document.querySelector('[role="group"][aria-label="Pending attachments"]')
     if (el === null) throw new Error('attachment rail missing')
     return el
   }, { timeout: 5_000 })
@@ -137,56 +126,44 @@ it('accepts pasted images into the composer rail in order and removes them', asy
   if (remove.length !== 2) throw new Error('remove buttons missing')
   for (const button of remove) fireEvent.click(button)
   await waitFor(() => {
-    expect(document.querySelector('[role="group"][aria-label="Pending images"]')).toBeNull()
+    expect(document.querySelector('[role="group"][aria-label="Pending attachments"]')).toBeNull()
   })
 
-  // An unsupported file announces a transient toast (the inline strip is
-  // gone) and the banner dismisses itself after its hold-and-fade lifetime.
+  // A non-image paste follows the generic-file path and remains in the
+  // composer as a file card.
   fireEvent.paste(textarea, {
     clipboardData: {
       items: [{ kind: 'file', type: 'text/plain', getAsFile: () => new File(['x'], 'notes.txt', { type: 'text/plain' }) }],
       getData: () => '',
     },
   })
-  const unsupportedMessage = 'Only PNG, JPG, WebP, and GIF images are supported'
-  const toast = await screen.findByText(unsupportedMessage)
-  expect(toast.closest('[role="alert"]')).not.toBeNull()
-  await waitFor(() => {
-    expect(screen.queryByText(unsupportedMessage)).toBeNull()
-  }, { timeout: 6_000 })
+  const files = await screen.findByRole('group', { name: 'Pending attachments' })
+  expect(files.textContent).toContain('notes.txt')
 })
 
 it('accepts a whole-page drop under the limits-labeled overlay and refuses an over-limit batch at intake', async () => {
-  mountAssembledApp()
-
-  const tree = await screen.findByRole('tree', { name: 'Sessions' }, { timeout: 10_000 })
-  const start = tree.querySelector<HTMLButtonElement>('button[aria-label="New session in fixture"]')
-  if (start === null) throw new Error('fixture Workspace new-session action missing')
-  fireEvent.click(start)
-  const textarea = await waitFor(() => {
-    const surface = document.querySelector<HTMLElement>(
-      '[data-composer-input][data-placeholder="Describe what you want to build... / commands, @ files or sessions"]',
-    )
-    if (surface === null) throw new Error('composer surface missing')
-    return surface
-  }, { timeout: 10_000 })
+  const remote = mountAssembledApp()
+  const textarea = await createAssembledSessionComposer(remote)
 
   // A file drag anywhere over the page raises the full-viewport overlay whose
   // desc line carries the projected limits — copy that can only render after
-  // the imageLimits projection crossed the real fixture transport.
+  // the imageLimits projection crossed the RemoteMock transport.
   const image = new File([new Uint8Array([137, 80, 78, 71])], 'dropped.png', { type: 'image/png' })
-  const dataTransfer = { types: ['Files'], files: [image], dropEffect: 'none' }
+  const dataTransfer = {
+    types: ['Files'], files: [image], dropEffect: 'none',
+    items: [{ kind: 'file', getAsFile: () => image, webkitGetAsEntry: () => ({ isDirectory: false }) }],
+  }
   fireEvent.dragEnter(document.body, { dataTransfer })
   const overlay = await screen.findByRole('status')
-  expect(overlay.textContent).toContain('Drag images here to add them')
+  expect(overlay.textContent).toContain('Drag files or images here to add them')
   await waitFor(() => {
-    expect(overlay.textContent).toContain('Up to 20 images, 5MB each')
+    expect(overlay.textContent).toContain('Image limit: up to 20 images, 5MB each')
   })
 
   // Dropping on the transcript area (not the composer card) lands in the rail.
   fireEvent.drop(document.body, { dataTransfer })
   await waitFor(() => {
-    const rail = document.querySelector('[role="group"][aria-label="Pending images"]')
+    const rail = document.querySelector('[role="group"][aria-label="Pending attachments"]')
     if (rail === null) throw new Error('attachment rail missing after page drop')
     expect([...rail.querySelectorAll('img')].map(img => img.getAttribute('alt'))).toEqual(['dropped.png'])
   }, { timeout: 5_000 })
@@ -206,25 +183,13 @@ it('accepts a whole-page drop under the limits-labeled overlay and refuses an ov
   const limitMessage = 'A message can include up to 20 images'
   const banner = await screen.findByText(limitMessage)
   expect(banner.closest('[role="alert"]')).not.toBeNull()
-  const rail = document.querySelector('[role="group"][aria-label="Pending images"]')
+  const rail = document.querySelector('[role="group"][aria-label="Pending attachments"]')
   expect([...(rail?.querySelectorAll('img') ?? [])]).toHaveLength(1)
 })
 
 it('renders a host dimension rejection with the projected 2000px limit', async () => {
-  mountAssembledApp('?fixture&fixturePrompt=reject')
-
-  const tree = await screen.findByRole('tree', { name: 'Sessions' }, { timeout: 10_000 })
-  const start = tree.querySelector<HTMLButtonElement>('button[aria-label="New session in fixture"]')
-  if (start === null) throw new Error('fixture Workspace new-session action missing')
-  fireEvent.click(start)
-
-  const textarea = await waitFor(() => {
-    const surface = document.querySelector<HTMLElement>(
-      '[data-composer-input][data-placeholder="Describe what you want to build... / commands, @ files or sessions"]',
-    )
-    if (surface === null) throw new Error('composer surface missing')
-    return surface
-  }, { timeout: 10_000 })
+  const remote = mountAssembledApp({ remote: { rejectPrompt: true } })
+  const textarea = await createAssembledSessionComposer(remote)
   const image = new File([new Uint8Array([137, 80, 78, 71])], 'too-wide.png', { type: 'image/png' })
   fireEvent.paste(textarea, {
     clipboardData: {
@@ -233,7 +198,7 @@ it('renders a host dimension rejection with the projected 2000px limit', async (
     },
   })
   await waitFor(() => {
-    expect(document.querySelector('[role="group"][aria-label="Pending images"]')).not.toBeNull()
+    expect(document.querySelector('[role="group"][aria-label="Pending attachments"]')).not.toBeNull()
   })
   fireEvent.keyDown(textarea, { key: 'Enter' })
 
@@ -245,5 +210,5 @@ it('renders a host dimension rejection with the projected 2000px limit', async (
       "text": "Image sides must be at most 2000px; downscale it and try again",
     }
   `)
-  expect(document.querySelector('[role="group"][aria-label="Pending images"]')).not.toBeNull()
+  expect(document.querySelector('[role="group"][aria-label="Pending attachments"]')).not.toBeNull()
 })

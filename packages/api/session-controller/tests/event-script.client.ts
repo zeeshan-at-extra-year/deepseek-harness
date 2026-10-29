@@ -8,9 +8,22 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm/types'
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
 import type {
   SessionEventEntry,
-  SessionPage,
+  SessionEventsPage,
   SessionWireEvent,
 } from '../src/types.ts'
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'compact-checkpoint': { kind: 'compact-checkpoint'; compactionId: string }
+  }
+}
+
+type CheckpointSource = { kind: 'compact-checkpoint'; compactionId: string }
+
+/** Build a typed checkpoint source for the history event script. */
+function checkpointSource(): CheckpointSource {
+  return { kind: 'compact-checkpoint', compactionId: 'event-script-compaction' }
+}
 
 /** One text content block (local helper). */
 const text = (t: string): ContentBlock[] => [{ type: 'text', text: t }]
@@ -27,13 +40,18 @@ export const ev = {
     }) }),
   stepStart: (seq: SessionSeq, turn: number, step = 0): SessionEvent =>
     at(seq, { type: 'step/start', data: { turn, step } }),
-  chunkStart: (seq: SessionSeq, turn: number, step = 0, index = 0): SessionEvent =>
-    at(seq, { type: 'assistant/chunk', data: { turn, step, chunk: { type: 'block-start', index, blockType: 'text' } } }),
-  chunkText: (seq: SessionSeq, turn: number, piece: string, step = 0, index = 0): SessionEvent =>
-    at(seq, { type: 'assistant/chunk', data: { turn, step, chunk: { type: 'text-delta', index, text: piece } } }),
   assistant: (seq: SessionSeq, turn: number, body: string, step = 0): SessionEvent =>
     at(seq, { type: 'assistant/message', surfaceOp: 'append', data: {
       turn, step,
+      stream: [
+        { type: 'chunk', time: 1_700_000_000_000 + seq, chunk: { type: 'block-start', index: 0, blockType: 'text' } },
+        { type: 'text-chunks', time0: 1_700_000_000_000 + seq, index: 0, dt: [], texts: [body] },
+        {
+          type: 'chunk', time: 1_700_000_000_000 + seq,
+          chunk: { type: 'block-end', index: 0, block: { type: 'text', text: body } },
+        },
+        { type: 'chunk', time: 1_700_000_000_000 + seq, chunk: { type: 'finish', reason: { kind: 'stop' } } },
+      ],
       message: createMessage({
         role: 'assistant',
         content: text(body),
@@ -61,8 +79,8 @@ export const ev = {
     }),
   codeDispatchStart: (seq: SessionSeq, parentCallId: string, n: number, name: string, args: unknown): SessionEvent =>
     at(seq, {
-      type: 'tool/code-dispatch-start',
-      data: { rootCallId: parentCallId, parentCallId, subCallId: `${parentCallId}:code:${n}`, name, arguments: args },
+      type: 'tool/ptc-dispatch-start',
+      data: { rootCallId: parentCallId, parentCallId, subCallId: `${parentCallId}:ptc:${n}`, name, arguments: args },
     }),
   codeDispatch: (
     seq: SessionSeq,
@@ -74,8 +92,8 @@ export const ev = {
     isError = false,
   ): SessionEvent =>
     at(seq, {
-      type: 'tool/code-dispatch',
-      data: { rootCallId: parentCallId, parentCallId, subCallId: `${parentCallId}:code:${n}`, name, arguments: args, isError, content: text(body) },
+      type: 'tool/ptc-dispatch',
+      data: { rootCallId: parentCallId, parentCallId, subCallId: `${parentCallId}:ptc:${n}`, name, arguments: args, isError, content: text(body) },
     }),
   stepEnd: (seq: SessionSeq, turn: number, step = 0): SessionEvent =>
     at(seq, { type: 'step/end', data: { turn, step } }),
@@ -140,11 +158,11 @@ export const ev = {
   ): SessionEvent =>
     at(seq, {
       type: 'user/message',
-      surfaceOp: { op: 'replace', start, end },
+      surfaceOp: { op: 'replace', startSeq: start, endSeq: end },
       sourceEventSeqs: [summarySeq, start, end],
       data: createUserMessage({
         content: text('<context_checkpoint>model only</context_checkpoint>'),
-        source: { kind: 'plugin', plugin: 'compact' },
+        source: checkpointSource(),
       }),
     }),
 }
@@ -167,8 +185,9 @@ export function entries(events: readonly SessionEvent[]): SessionEventEntry[] {
 }
 
 /** Build one view-less history response value. */
-export function historyValue(events: readonly SessionEvent[], hasMore = false): SessionPage {
+export function historyValue(events: readonly SessionEvent[], hasMore = false): SessionEventsPage {
   return {
+    cursor: events.at(-1)?.seq ?? -1,
     records: entries(events),
     hasMore,
   }
